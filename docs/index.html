@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SMS送信侍</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Kosugi+Maru&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary:      #007BFF;
+      --primary-dark: #0056b3;
+      --bg:           #f5f5f5;
+      --card:         #fff;
+      --border:       #ccc;
+      --text:         #333;
+      --sub:          #666;
+      --danger:       #dc3545;
+      --success:      #28a745;
+      --radius:       8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Kosugi Maru', sans-serif;
+      background: var(--bg);
+      font-size: 18px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--primary);
+      color: #fff;
+      padding: 14px 20px;
+      text-align: center;
+    }
+    header h1 { font-size: 20px; letter-spacing: .05em; }
+
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 14px 12px;
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: var(--radius);
+      box-shadow: 0 2px 8px rgba(0,0,0,.1);
+      padding: 20px 18px;
+    }
+
+    /* ── サインイン ─────────────────────────────── */
+    #signin-area .card {
+      text-align: center;
+      padding: 40px 20px;
+    }
+    #signin-area p { color: var(--sub); margin-bottom: 24px; font-size: 16px; }
+    #signin-btn { display: inline-block; min-height: 44px; }
+
+    /* ── ユーザー情報バー ───────────────────────── */
+    #user-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 16px;
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--sub);
+    }
+    #signout-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 12px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      color: var(--sub);
+    }
+    #signout-btn:hover { background: var(--bg); }
+
+    /* ── 中央テキスト（ローディング・権限なし） ── */
+    .center-msg {
+      text-align: center;
+      color: var(--sub);
+      padding: 36px 0;
+      font-size: 16px;
+    }
+    #no-permission-area .center-msg { color: var(--danger); }
+
+    /* ── 送信元バッジ ───────────────────────────── */
+    #account-badge {
+      background: #e8f5e9;
+      border: 1px solid #a5d6a7;
+      border-radius: var(--radius);
+      padding: 10px 16px;
+      margin-bottom: 22px;
+      font-size: 15px;
+      color: var(--sub);
+    }
+    #account-badge strong {
+      display: block;
+      font-size: 19px;
+      color: #1b5e20;
+      margin-top: 2px;
+    }
+
+    /* ── フォーム ───────────────────────────────── */
+    label {
+      display: block;
+      font-size: 14px;
+      font-weight: bold;
+      color: var(--sub);
+      margin: 18px 0 6px;
+    }
+    label:first-of-type { margin-top: 0; }
+
+    select,
+    input[type="tel"],
+    textarea {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 17px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color .15s;
+      background: var(--card);
+    }
+    select:focus, input:focus, textarea:focus { border-color: var(--primary); }
+    textarea { resize: vertical; min-height: 130px; }
+
+    .textarea-wrap { position: relative; }
+    #charCount {
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      font-size: 12px;
+      color: var(--sub);
+      pointer-events: none;
+    }
+    #charCount.over { color: var(--danger); font-weight: bold; }
+
+    #sendBtn {
+      width: 100%;
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius);
+      padding: 16px;
+      font-size: 18px;
+      font-family: inherit;
+      cursor: pointer;
+      margin-top: 22px;
+      transition: background .15s;
+    }
+    #sendBtn:hover:not(:disabled) { background: var(--primary-dark); }
+    #sendBtn:disabled { background: var(--border); cursor: not-allowed; }
+
+    #ping-link {
+      display: block;
+      text-align: right;
+      font-size: 12px;
+      color: var(--sub);
+      margin-top: 10px;
+      cursor: pointer;
+      text-decoration: underline;
+    }
+    #ping-link:hover { color: var(--text); }
+
+    /* ── 確認モーダル ───────────────────────────── */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      padding: 16px;
+    }
+    .modal-card {
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 24px 20px;
+      width: 100%;
+      max-width: 480px;
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+    .modal-card h2 { font-size: 19px; margin-bottom: 18px; }
+
+    .modal-field { margin-bottom: 14px; }
+    .modal-field strong {
+      display: block;
+      font-size: 12px;
+      color: var(--sub);
+      margin-bottom: 3px;
+    }
+    .modal-field span { font-size: 16px; }
+
+    #modal-text {
+      background: #f8f8f8;
+      border-radius: 4px;
+      padding: 10px 12px;
+      font-size: 15px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 180px;
+      overflow-y: auto;
+      margin-top: 3px;
+    }
+
+    .modal-actions { display: flex; gap: 12px; margin-top: 22px; }
+    .modal-actions button {
+      flex: 1;
+      padding: 14px;
+      border-radius: var(--radius);
+      font-size: 16px;
+      font-family: inherit;
+      cursor: pointer;
+      border: none;
+    }
+    #cancelBtn { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+    #confirmBtn { background: var(--primary); color: #fff; }
+    #confirmBtn:hover { background: var(--primary-dark); }
+
+    /* ── スピナー ───────────────────────────────── */
+    #spinner-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(255,255,255,.72);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 200;
+    }
+    .spinner {
+      width: 46px;
+      height: 46px;
+      border: 5px solid var(--border);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── トースト ───────────────────────────────── */
+    #toast {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%) translateY(120px);
+      background: #333;
+      color: #fff;
+      padding: 14px 24px;
+      border-radius: 28px;
+      font-size: 15px;
+      max-width: 80vw;
+      text-align: center;
+      transition: transform .28s ease;
+      z-index: 300;
+      pointer-events: none;
+    }
+    #toast.show    { transform: translateX(-50%) translateY(0); }
+    #toast.success { background: var(--success); }
+    #toast.error   { background: var(--danger); }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>SMS送信侍</h1>
+</header>
+
+<!-- ── サインイン画面 ──────────────────────────────────── -->
+<div id="signin-area">
+  <div class="container">
+    <div class="card">
+      <p>Google アカウントでログインしてください</p>
+      <div id="signin-btn"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── アプリ画面（ログイン後） ──────────────────────── -->
+<div id="app-area" class="hidden">
+  <div id="user-info">
+    <span>ログイン中: <span id="user-email"></span></span>
+    <button id="signout-btn">ログアウト</button>
+  </div>
+
+  <div class="container">
+    <div class="card">
+
+      <!-- アカウント確認中 -->
+      <div id="checking-area" class="hidden">
+        <p class="center-msg">アカウント確認中...</p>
+      </div>
+
+      <!-- 権限なし -->
+      <div id="no-permission-area" class="hidden">
+        <div class="center-msg">
+          <p>このアカウントには送信権限がありません</p>
+          <p style="font-size:13px;margin-top:8px;">管理者に連絡してください</p>
+        </div>
+      </div>
+
+      <!-- フォーム（アカウント確定後に表示） -->
+      <div id="form-section" class="hidden">
+
+        <!-- 送信元（読み取り専用） -->
+        <div id="account-badge">
+          <span>送信元</span>
+          <strong id="account-label"></strong>
+        </div>
+
+        <form id="smsForm">
+          <label for="countryCode">国番号</label>
+          <select id="countryCode" name="countryCode"></select>
+
+          <label for="phoneNumber">電話番号</label>
+          <input
+            type="tel"
+            id="phoneNumber"
+            name="phoneNumber"
+            placeholder="080xxxxxxxx"
+            inputmode="numeric"
+            required
+          >
+
+          <label for="message">メッセージ</label>
+          <div class="textarea-wrap">
+            <textarea id="message" name="message" rows="5" required></textarea>
+            <div id="charCount">0 / 660 (0 SMS)</div>
+          </div>
+
+          <button type="submit" id="sendBtn" disabled>送信</button>
+        </form>
+
+        <span id="ping-link">疎通確認 (ping)</span>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── 送信確認モーダル ──────────────────────────────── -->
+<div id="modal" class="modal-overlay hidden">
+  <div class="modal-card">
+    <h2>送信確認</h2>
+    <div class="modal-field">
+      <strong>送信元</strong>
+      <span id="modal-account"></span>
+    </div>
+    <div class="modal-field">
+      <strong>宛先</strong>
+      <span id="modal-to"></span>
+    </div>
+    <div class="modal-field">
+      <strong>メッセージ</strong>
+      <div id="modal-text"></div>
+    </div>
+    <div class="modal-field">
+      <strong>送信数</strong>
+      <span id="modal-segments"></span>
+    </div>
+    <div class="modal-actions">
+      <button id="cancelBtn">キャンセル</button>
+      <button id="confirmBtn">送信する</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── スピナー ──────────────────────────────────────── -->
+<div id="spinner-overlay" class="hidden">
+  <div class="spinner"></div>
+</div>
+
+<!-- ── トースト通知 ──────────────────────────────────── -->
+<div id="toast"></div>
+
+<!-- ── スクリプト ────────────────────────────────────── -->
+<script src="./country-codes.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+// ── 設定 ─────────────────────────────────────────────────────────────
+const CLIENT_ID  = '207643613287-2cpjgpupqu3tovgo60em3vor52rnvjme.apps.googleusercontent.com';
+const WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbxRCrEUgkVl0vPPB-SIbQJXcezxswj81xi1d9ak0OPE9CYHuIUs1l0IpYIZycjYXjd3/exec';
+
+// SMS セグメントルール（api.js の SMS_RULES と必ず一致させること）
+// Rakuten CPaaS unicode モード: 1セグメント70文字、上限660文字
+const SMS_RULES = { SEGMENT: 70, MAX: 660 };
+
+// ── アプリ状態（メモリのみ保持。localStorage/sessionStorage には書かない） ──
+let idToken     = null;  // XSS 対策: メモリのみ。リロードで再ログイン。
+let userEmail   = null;
+let userAccount = null;  // サーバの ping レスポンスから取得。クライアントでは設定しない。
+let userLabel   = null;  // 表示用ラベル（例: "銀座東京フラワー"）
+
+// ── 起動 ─────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  populateCountrySelect();
+  setupEventListeners();
+  updateCharCount();
+  renderApp();
+  initGsi();
+});
+
+// ── 国番号セレクト初期化 ─────────────────────────────────────────────
+function populateCountrySelect() {
+  const sel = document.getElementById('countryCode');
+  (window.COUNTRY_CODES || []).forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c.value;
+    opt.textContent = c.label;
+    if (c.defaultSelected) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+// ── イベントリスナー ─────────────────────────────────────────────────
+function setupEventListeners() {
+  document.getElementById('signout-btn').addEventListener('click', signOut);
+  document.getElementById('smsForm').addEventListener('submit', handleFormSubmit);
+  document.getElementById('message').addEventListener('input', updateCharCount);
+  document.getElementById('cancelBtn').addEventListener('click', () => {
+    document.getElementById('modal').classList.add('hidden');
+  });
+  document.getElementById('confirmBtn').addEventListener('click', handleConfirm);
+  document.getElementById('ping-link').addEventListener('click', pingTest);
+}
+
+// ── Google Identity Services ─────────────────────────────────────────
+function initGsi() {
+  if (typeof google === 'undefined' || !google.accounts) {
+    setTimeout(initGsi, 100);
+    return;
+  }
+  google.accounts.id.initialize({
+    client_id:   CLIENT_ID,
+    callback:    handleCredential,
+    auto_select: false
+  });
+  google.accounts.id.renderButton(
+    document.getElementById('signin-btn'),
+    { theme: 'outline', size: 'large', locale: 'ja', width: 280 }
+  );
+}
+
+function handleCredential(response) {
+  idToken     = response.credential;  // メモリのみ保持
+  userEmail   = parseJwtPayload(idToken).email || '';
+  userAccount = null;
+  userLabel   = null;
+  renderApp();          // 「確認中」状態を表示
+  pingForAccount();     // サーバにアカウントを問い合わせ
+}
+
+function signOut() {
+  idToken     = null;
+  userEmail   = null;
+  userAccount = null;
+  userLabel   = null;
+  if (typeof google !== 'undefined' && google.accounts) {
+    google.accounts.id.disableAutoSelect();
+  }
+  renderApp();
+}
+
+function parseJwtPayload(token) {
+  try {
+    const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(atob(b64));
+  } catch { return {}; }
+}
+
+// ── ログイン直後にサーバへアカウントを問い合わせる ─────────────────
+async function pingForAccount() {
+  try {
+    const data = await callApi('ping', {});
+    if (data.ok) {
+      userAccount = data.result.account;
+      userLabel   = data.result.label;
+    } else {
+      userAccount = null;  // 権限なし
+      userLabel   = null;
+    }
+  } catch {
+    userAccount = null;
+    userLabel   = null;
+  }
+  renderApp();
+}
+
+// ── UI レンダリング ───────────────────────────────────────────────────
+function renderApp() {
+  const loggedIn = !!idToken;
+  document.getElementById('signin-area').classList.toggle('hidden', loggedIn);
+  document.getElementById('app-area').classList.toggle('hidden', !loggedIn);
+
+  if (!loggedIn) return;
+
+  document.getElementById('user-email').textContent = userEmail;
+
+  const isPending    = loggedIn && userAccount === null && userLabel === null;
+  const hasAccount   = !!userAccount;
+  const noPermission = loggedIn && !isPending && !hasAccount;
+
+  document.getElementById('checking-area').classList.toggle('hidden', !isPending);
+  document.getElementById('no-permission-area').classList.toggle('hidden', !noPermission);
+  document.getElementById('form-section').classList.toggle('hidden', !hasAccount);
+
+  if (hasAccount) {
+    document.getElementById('account-label').textContent = userLabel;
+  }
+}
+
+// ── 文字数カウント ────────────────────────────────────────────────────
+// フロントはあくまで表示用。権威はサーバ側（api.js の SMS_RULES）。
+function updateCharCount() {
+  const len  = document.getElementById('message').value.length;
+  const segs = len === 0 ? 0 : Math.ceil(len / SMS_RULES.SEGMENT);
+  const over = len > SMS_RULES.MAX;
+  const el   = document.getElementById('charCount');
+  el.textContent = `${len} / ${SMS_RULES.MAX} (${segs} SMS)`;
+  el.classList.toggle('over', over);
+  document.getElementById('sendBtn').disabled = over || len === 0;
+}
+
+// ── フォーム送信 → 確認モーダル ──────────────────────────────────────
+function handleFormSubmit(e) {
+  e.preventDefault();
+
+  const cc   = document.getElementById('countryCode').value;
+  let phone  = document.getElementById('phoneNumber').value.trim();
+  if (phone.startsWith('0')) phone = phone.slice(1);
+  const to   = cc + phone;
+  const text = document.getElementById('message').value;
+  const segs = Math.ceil(text.length / SMS_RULES.SEGMENT);
+
+  document.getElementById('modal-account').textContent  = userLabel;
+  document.getElementById('modal-to').textContent       = '+' + to;
+  document.getElementById('modal-text').textContent     = text;
+  document.getElementById('modal-segments').textContent = `${segs} SMS`;
+  document.getElementById('modal').classList.remove('hidden');
+}
+
+// ── 確認後の実送信 ────────────────────────────────────────────────────
+async function handleConfirm() {
+  document.getElementById('modal').classList.add('hidden');
+
+  const cc   = document.getElementById('countryCode').value;
+  let phone  = document.getElementById('phoneNumber').value.trim();
+  if (phone.startsWith('0')) phone = phone.slice(1);
+  const to   = cc + phone;
+  const text = document.getElementById('message').value;
+
+  showSpinner(true);
+  try {
+    // account はペイロードに含めない。サーバがログインメールから自動決定する。
+    const data = await callApi('sendSms', { to, text });
+    showSpinner(false);
+    if (data.ok) {
+      document.getElementById('message').value = '';
+      updateCharCount();
+      showToast('送信しました (' + data.result.segments + ' SMS)', 'success');
+    } else {
+      showToast('エラー: ' + data.error, 'error');
+    }
+  } catch (err) {
+    showSpinner(false);
+    showToast('通信エラー: ' + err.message, 'error');
+  }
+}
+
+// ── ping テスト（疎通確認。実 SMS は送らない） ────────────────────────
+async function pingTest() {
+  if (!idToken) { showToast('ログインしてください', 'error'); return; }
+  showSpinner(true);
+  try {
+    const data = await callApi('ping', {});
+    showSpinner(false);
+    if (data.ok) {
+      showToast(`ping OK: ${data.result.user} (${data.result.label})`, 'success');
+    } else {
+      showToast('ping エラー: ' + data.error, 'error');
+    }
+  } catch (err) {
+    showSpinner(false);
+    showToast('ping 失敗: ' + err.message, 'error');
+  }
+}
+
+// ── GAS Web App API 呼び出し ──────────────────────────────────────────
+async function callApi(action, payload) {
+  if (!idToken) {
+    if (typeof google !== 'undefined' && google.accounts) google.accounts.id.prompt();
+    throw new Error('未ログイン');
+  }
+  const res = await fetch(WEBAPP_URL, {
+    method:  'POST',
+    // text/plain: CORS preflight を回避（GAS は OPTIONS に対応しないため）
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body:    JSON.stringify({ action, idToken, ...payload })
+  });
+  const data = await res.json();
+  // トークン期限切れ等 → サインイン画面へ誘導
+  if (!data.ok && /ログイン|トークン|aud|許可/.test(data.error || '')) {
+    idToken     = null;
+    userAccount = null;
+    userLabel   = null;
+    if (typeof google !== 'undefined' && google.accounts) google.accounts.id.prompt();
+    renderApp();
+  }
+  return data;
+}
+
+// ── UI ヘルパー ───────────────────────────────────────────────────────
+function showSpinner(visible) {
+  document.getElementById('spinner-overlay').classList.toggle('hidden', !visible);
+}
+
+let _toastTimer;
+function showToast(msg, type = '') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show' + (type ? ' ' + type : '');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { el.className = ''; }, 4000);
+}
+</script>
+</body>
+</html>
