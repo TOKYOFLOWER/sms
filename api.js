@@ -401,7 +401,9 @@ function safeEqual_(a, b) {
 
 function decodeBase64Str_(b64) {
   try {
-    return Utilities.newBlob(Utilities.base64Decode(b64)).getDataAsString();
+    // シートの値が "BASE64:xxxxx" 形式で保存されている場合はプレフィックスを除去
+    var s = String(b64 || '').replace(/^BASE64:/i, '');
+    return Utilities.newBlob(Utilities.base64Decode(s)).getDataAsString();
   } catch (_) { return ''; }
 }
 
