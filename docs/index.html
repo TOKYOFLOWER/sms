@@ -49,7 +49,7 @@
     .brandmark{font-family:var(--font-display); font-weight:700; letter-spacing:.02em; font-size:18px; white-space:nowrap; flex-shrink:0}
     .who{display:flex; align-items:center; gap:var(--s2); color:var(--muted); font-size:12px; min-width:0}
     .who-dot{width:7px;height:7px;border-radius:50%;background:var(--brand);flex:none}
-    .who-mail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:46vw}
+    .who-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:46vw}
     .btn-ghost{
       font:inherit; font-size:12px; color:var(--muted); background:transparent;
       border:1px solid var(--border); border-radius:var(--r-chip);
@@ -99,6 +99,40 @@
       text-align:right; margin-top:6px}
     .meter.over{color:var(--danger)}
 
+    /* ── ログインカード専用フィールド ──────────────── */
+    .auth-card{max-width:380px; margin:14vh auto 0; padding:var(--s4)}
+    .auth-card .card{padding:var(--s6)}
+    .auth-card h1{font-family:var(--font-display); font-weight:700; font-size:18px; margin:0 0 var(--s2)}
+    .auth-card p.sub{color:var(--muted); font-size:14px; margin:0 0 var(--s5)}
+    .auth-field{margin-bottom:var(--s4)}
+    .auth-field label{
+      display:block; font-family:var(--font-mono); font-size:11px;
+      letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin-bottom:6px;
+    }
+    .auth-field input{
+      width:100%; font-family:var(--font-ui); font-size:15px; color:var(--ink);
+      background:var(--surface-2); border:1px solid var(--border);
+      border-radius:var(--r-field); padding:12px 14px; min-height:44px;
+    }
+    .auth-field input:focus{
+      outline:none; border-color:var(--focus);
+      box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 25%,transparent);
+    }
+    .auth-field input.otp-input{
+      font-family:var(--font-mono); font-size:22px; letter-spacing:.4em;
+      text-align:center;
+    }
+
+    /* ── OTP ヒント・再送 ──────────────────────────── */
+    .otp-hint{font-size:13px; color:var(--muted); margin-bottom:var(--s4); line-height:1.5}
+    .otp-hint strong{color:var(--ink)}
+    #resend-row{text-align:right; font-size:12px; margin-top:var(--s2)}
+    #resend-btn{
+      background:none; border:none; color:var(--brand); cursor:pointer;
+      font:inherit; font-size:12px; text-decoration:underline; padding:0;
+    }
+    #resend-btn:disabled{color:var(--muted); cursor:default; text-decoration:none}
+
     /* ── 送信ボタン ────────────────────────────────── */
     .btn-send{
       width:100%; font:inherit; font-weight:700; font-size:16px;
@@ -126,12 +160,6 @@
     }
     .foot .latin{font-family:var(--font-display); letter-spacing:.02em; color:var(--ink)}
     .foot .sep{opacity:.5; margin:0 6px}
-
-    /* ── サインイン画面 ────────────────────────────── */
-    .signin{max-width:380px; margin:14vh auto 0; padding:var(--s4); text-align:center}
-    .signin .card{padding:var(--s6)}
-    .signin h1{font-family:var(--font-display); font-weight:700; font-size:18px; margin:0 0 var(--s3)}
-    .signin p{color:var(--muted); font-size:14px; margin:0 0 var(--s5)}
 
     /* ── 中央メッセージ ─────────────────────────────── */
     .center-msg{text-align:center; color:var(--muted); padding:var(--s6) var(--s4); font-size:14px}
@@ -193,50 +221,103 @@
 </head>
 <body>
 
-<!-- ── サインイン画面 ─────────────────────────────────────────── -->
-<div id="signin-area">
-  <div class="signin">
+<!-- ── STEP 1: ログイン画面（id + pw） ──────────────────────────── -->
+<div id="step-login">
+  <div class="auth-card">
     <div class="card">
       <h1>SMS送信侍</h1>
-      <p>Googleアカウントでログイン</p>
-      <div id="signin-btn"></div>
+      <p class="sub">GSD会員IDでログイン</p>
+      <form id="loginForm" novalidate>
+        <div class="auth-field">
+          <label for="login-id">会員ID</label>
+          <input
+            type="text"
+            id="login-id"
+            name="id"
+            autocomplete="username"
+            required
+            placeholder="your-id"
+          >
+        </div>
+        <div class="auth-field">
+          <label for="login-pw">パスワード</label>
+          <input
+            type="password"
+            id="login-pw"
+            name="pw"
+            autocomplete="current-password"
+            required
+            placeholder="••••••••"
+          >
+        </div>
+        <button type="submit" class="btn-send" id="loginBtn">ログイン</button>
+      </form>
     </div>
   </div>
 </div>
 
-<!-- ── アプリ画面（ログイン後） ─────────────────────────────── -->
+<!-- ── STEP 2: OTP 画面 ──────────────────────────────────────────── -->
+<div id="step-otp" class="hidden">
+  <div class="auth-card">
+    <div class="card">
+      <h1>認証コードを入力</h1>
+      <p class="otp-hint" id="otp-hint">登録メールアドレスに6桁のコードを送信しました。</p>
+      <form id="otpForm" novalidate>
+        <div class="auth-field">
+          <label for="otp-code">認証コード</label>
+          <input
+            type="text"
+            id="otp-code"
+            name="otp"
+            class="otp-input"
+            autocomplete="one-time-code"
+            inputmode="numeric"
+            pattern="[0-9]{6}"
+            maxlength="6"
+            required
+            placeholder="000000"
+          >
+        </div>
+        <button type="submit" class="btn-send" id="otpBtn">認証する</button>
+        <div id="resend-row">
+          <button type="button" id="resend-btn" disabled>再送 (<span id="resend-timer">60</span>s)</button>
+        </div>
+      </form>
+      <div style="margin-top:var(--s4);text-align:center">
+        <button type="button" class="btn-ghost" id="back-to-login">← ログインに戻る</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── STEP 3: 送信画面（ログイン後） ───────────────────────────── -->
 <div id="app-area" class="hidden">
 
-  <!-- Sticky topbar -->
   <header class="topbar">
     <span class="brandmark">SMS送信侍</span>
     <div class="who">
       <span class="who-dot"></span>
-      <span class="who-mail" id="user-email"></span>
+      <span class="who-name" id="user-name"></span>
       <button class="btn-ghost" id="signout-btn">ログアウト</button>
     </div>
   </header>
 
   <div class="wrap">
 
-    <!-- アカウント確認中 -->
     <div id="checking-area" class="hidden">
-      <p class="center-msg">アカウント確認中...</p>
+      <p class="center-msg">確認中...</p>
     </div>
 
-    <!-- 権限なし -->
     <div id="no-permission-area" class="hidden">
       <div class="card" style="text-align:center;padding:var(--s6)">
-        <p style="color:var(--danger);margin-bottom:var(--s2)">このアカウントには送信権限がありません</p>
+        <p style="color:var(--danger);margin-bottom:var(--s2)">送信権限がありません</p>
         <p style="font-size:13px;color:var(--muted)">管理者に連絡してください</p>
       </div>
     </div>
 
-    <!-- フォーム（アカウント確定後） -->
     <div id="form-section" class="hidden">
       <div class="card">
 
-        <!-- 送信元クレジット -->
         <div class="sender" id="account-badge">
           <div>
             <div class="sender-label">送信元 · SENDER</div>
@@ -246,8 +327,6 @@
         </div>
 
         <form id="smsForm">
-
-          <!-- 宛先 -->
           <div class="field">
             <div class="eyebrow">宛先 · TO</div>
             <div class="row">
@@ -264,7 +343,6 @@
             </div>
           </div>
 
-          <!-- 本文 -->
           <div class="field">
             <div class="eyebrow">本文 · MESSAGE</div>
             <textarea id="message" name="message" class="textarea" rows="5" required></textarea>
@@ -280,14 +358,13 @@
 
   </div>
 
-  <!-- フッター -->
   <footer class="foot">
     A GSD tool<span class="sep">·</span>powered by <span class="latin">Ginza TOKYOFLOWER</span>
   </footer>
 
 </div>
 
-<!-- ── 送信確認モーダル ─────────────────────────────────────── -->
+<!-- ── 送信確認モーダル ──────────────────────────────────────────── -->
 <div id="modal" class="modal-bg hidden">
   <div class="modal-inner">
     <h2>送信確認</h2>
@@ -314,42 +391,35 @@
   </div>
 </div>
 
-<!-- ── スピナー ──────────────────────────────────────────────── -->
+<!-- ── スピナー ──────────────────────────────────────────────────── -->
 <div id="spinner-overlay" class="hidden">
   <div class="spinner"></div>
 </div>
 
-<!-- ── トースト通知 ──────────────────────────────────────────── -->
+<!-- ── トースト通知 ──────────────────────────────────────────────── -->
 <div id="toast"></div>
 
-<!-- ── スクリプト ────────────────────────────────────────────── -->
+<!-- ── スクリプト ────────────────────────────────────────────────── -->
 <script src="./country-codes.js"></script>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
-// ── 設定 ─────────────────────────────────────────────────────────────
-const CLIENT_ID  = '207643613287-2cpjgpupqu3tovgo60em3vor52rnvjme.apps.googleusercontent.com';
 const WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbxRCrEUgkVl0vPPB-SIbQJXcezxswj81xi1d9ak0OPE9CYHuIUs1l0IpYIZycjYXjd3/exec';
+const SMS_RULES  = { SEGMENT: 70, MAX: 660 };
 
-// SMS セグメントルール（api.js の SMS_RULES と必ず一致させること）
-// Rakuten CPaaS unicode モード: 1セグメント70文字、上限660文字
-const SMS_RULES = { SEGMENT: 70, MAX: 660 };
+// ── アプリ状態（メモリのみ。XSS対策：localStorage に書かない） ──
+let token      = null;  // セッショントークン
+let pendingId  = null;  // ログイン中のID（OTP待ち）
+let userLabel  = null;  // sms_accounts.label
+let resendTimer = null;
 
-// ── アプリ状態（メモリのみ保持。localStorage/sessionStorage には書かない） ──
-let idToken     = null;  // XSS 対策: メモリのみ。リロードで再ログイン。
-let userEmail   = null;
-let userAccount = null;  // サーバの ping レスポンスから取得。クライアントでは設定しない。
-let userLabel   = null;  // 表示用ラベル（例: "銀座東京フラワー"）
-
-// ── 起動 ─────────────────────────────────────────────────────────────
+// ── 起動 ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   populateCountrySelect();
   setupEventListeners();
   updateCharCount();
-  renderApp();
-  initGsi();
+  showStep('login');
 });
 
-// ── 国番号セレクト初期化 ─────────────────────────────────────────────
+// ── 国番号セレクト初期化 ─────────────────────────────────────────
 function populateCountrySelect() {
   const sel = document.getElementById('countryCode');
   (window.COUNTRY_CODES || []).forEach(c => {
@@ -361,8 +431,15 @@ function populateCountrySelect() {
   });
 }
 
-// ── イベントリスナー ─────────────────────────────────────────────────
+// ── イベントリスナー ─────────────────────────────────────────────
 function setupEventListeners() {
+  document.getElementById('loginForm').addEventListener('submit', handleLogin);
+  document.getElementById('otpForm').addEventListener('submit', handleOtp);
+  document.getElementById('back-to-login').addEventListener('click', () => {
+    clearResendTimer();
+    showStep('login');
+  });
+  document.getElementById('resend-btn').addEventListener('click', handleResend);
   document.getElementById('signout-btn').addEventListener('click', signOut);
   document.getElementById('smsForm').addEventListener('submit', handleFormSubmit);
   document.getElementById('message').addEventListener('input', updateCharCount);
@@ -373,93 +450,129 @@ function setupEventListeners() {
   document.getElementById('ping-link').addEventListener('click', pingTest);
 }
 
-// ── Google Identity Services ─────────────────────────────────────────
-function initGsi() {
-  if (typeof google === 'undefined' || !google.accounts) {
-    setTimeout(initGsi, 100);
-    return;
-  }
-  google.accounts.id.initialize({
-    client_id:   CLIENT_ID,
-    callback:    handleCredential,
-    auto_select: false
-  });
-  google.accounts.id.renderButton(
-    document.getElementById('signin-btn'),
-    { theme: 'outline', size: 'large', locale: 'ja', width: 280 }
-  );
+// ── 画面ステップ切り替え ─────────────────────────────────────────
+function showStep(step) {
+  document.getElementById('step-login').classList.toggle('hidden', step !== 'login');
+  document.getElementById('step-otp').classList.toggle('hidden',   step !== 'otp');
+  document.getElementById('app-area').classList.toggle('hidden',   step !== 'app');
 }
 
-function handleCredential(response) {
-  idToken     = response.credential;  // メモリのみ保持
-  userEmail   = parseJwtPayload(idToken).email || '';
-  userAccount = null;
-  userLabel   = null;
-  renderApp();          // 「確認中」状態を表示
-  pingForAccount();     // サーバにアカウントを問い合わせ
+// ── STEP 1: ログイン（id + pw → login API） ──────────────────────
+async function handleLogin(e) {
+  e.preventDefault();
+  const id = document.getElementById('login-id').value.trim();
+  const pw = document.getElementById('login-pw').value;
+  if (!id || !pw) { showToast('IDとパスワードを入力してください', 'error'); return; }
+
+  showSpinner(true);
+  try {
+    const data = await callApi('login', { id, pw });
+    showSpinner(false);
+    if (data.ok) {
+      pendingId = id;
+      const hint = data.result.email_hint || '';
+      document.getElementById('otp-hint').innerHTML =
+        hint
+          ? `登録メール（<strong>${escHtml(hint)}</strong>）に6桁のコードを送信しました。`
+          : '登録メールアドレスに6桁のコードを送信しました。';
+      document.getElementById('otp-code').value = '';
+      showStep('otp');
+      startResendTimer();
+    } else {
+      showToast(data.error || 'ログインできませんでした', 'error');
+    }
+  } catch (err) {
+    showSpinner(false);
+    showToast('通信エラー: ' + err.message, 'error');
+  }
+}
+
+// ── STEP 2: OTP 照合（verifyOtp API） ───────────────────────────
+async function handleOtp(e) {
+  e.preventDefault();
+  const otp = document.getElementById('otp-code').value.trim();
+  if (!/^\d{6}$/.test(otp)) { showToast('6桁の数字を入力してください', 'error'); return; }
+
+  showSpinner(true);
+  try {
+    const data = await callApi('verifyOtp', { id: pendingId, otp });
+    showSpinner(false);
+    if (data.ok) {
+      token     = data.result.token;
+      userLabel = data.result.label;
+      clearResendTimer();
+      renderApp();
+      showStep('app');
+    } else {
+      showToast(data.error || '認証できませんでした', 'error');
+    }
+  } catch (err) {
+    showSpinner(false);
+    showToast('通信エラー: ' + err.message, 'error');
+  }
+}
+
+// ── OTP 再送 ─────────────────────────────────────────────────────
+async function handleResend() {
+  if (!pendingId) return;
+  const pw = document.getElementById('login-pw').value;
+  showSpinner(true);
+  try {
+    const data = await callApi('login', { id: pendingId, pw });
+    showSpinner(false);
+    if (data.ok) {
+      showToast('コードを再送しました', 'success');
+      startResendTimer();
+    } else {
+      showToast(data.error || '再送できませんでした', 'error');
+    }
+  } catch (err) {
+    showSpinner(false);
+    showToast('通信エラー: ' + err.message, 'error');
+  }
+}
+
+function startResendTimer() {
+  clearResendTimer();
+  let sec = 60;
+  const btn = document.getElementById('resend-btn');
+  const timerEl = document.getElementById('resend-timer');
+  btn.disabled = true;
+  timerEl.textContent = sec;
+  resendTimer = setInterval(() => {
+    sec--;
+    timerEl.textContent = sec;
+    if (sec <= 0) {
+      clearResendTimer();
+      btn.disabled = false;
+      btn.textContent = 'コードを再送';
+    }
+  }, 1000);
+}
+
+function clearResendTimer() {
+  if (resendTimer) { clearInterval(resendTimer); resendTimer = null; }
+}
+
+// ── STEP 3: アプリ画面レンダリング ──────────────────────────────
+function renderApp() {
+  document.getElementById('user-name').textContent = pendingId || '';
+  document.getElementById('checking-area').classList.add('hidden');
+  document.getElementById('no-permission-area').classList.add('hidden');
+  document.getElementById('form-section').classList.remove('hidden');
+  document.getElementById('account-label').textContent = userLabel || '';
 }
 
 function signOut() {
-  idToken     = null;
-  userEmail   = null;
-  userAccount = null;
-  userLabel   = null;
-  if (typeof google !== 'undefined' && google.accounts) {
-    google.accounts.id.disableAutoSelect();
-  }
-  renderApp();
+  token     = null;
+  pendingId = null;
+  userLabel = null;
+  document.getElementById('login-id').value = '';
+  document.getElementById('login-pw').value = '';
+  showStep('login');
 }
 
-function parseJwtPayload(token) {
-  try {
-    const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-    return JSON.parse(atob(b64));
-  } catch { return {}; }
-}
-
-// ── ログイン直後にサーバへアカウントを問い合わせる ─────────────────
-async function pingForAccount() {
-  try {
-    const data = await callApi('ping', {});
-    if (data.ok) {
-      userAccount = data.result.account;
-      userLabel   = data.result.label;
-    } else {
-      userAccount = null;  // 権限なし
-      userLabel   = null;
-    }
-  } catch {
-    userAccount = null;
-    userLabel   = null;
-  }
-  renderApp();
-}
-
-// ── UI レンダリング ───────────────────────────────────────────────────
-function renderApp() {
-  const loggedIn = !!idToken;
-  document.getElementById('signin-area').classList.toggle('hidden', loggedIn);
-  document.getElementById('app-area').classList.toggle('hidden', !loggedIn);
-
-  if (!loggedIn) return;
-
-  document.getElementById('user-email').textContent = userEmail;
-
-  const isPending    = loggedIn && userAccount === null && userLabel === null;
-  const hasAccount   = !!userAccount;
-  const noPermission = loggedIn && !isPending && !hasAccount;
-
-  document.getElementById('checking-area').classList.toggle('hidden', !isPending);
-  document.getElementById('no-permission-area').classList.toggle('hidden', !noPermission);
-  document.getElementById('form-section').classList.toggle('hidden', !hasAccount);
-
-  if (hasAccount) {
-    document.getElementById('account-label').textContent = userLabel;
-  }
-}
-
-// ── 文字数カウント ────────────────────────────────────────────────────
-// フロントはあくまで表示用。権威はサーバ側（api.js の SMS_RULES）。
+// ── 文字数カウント ────────────────────────────────────────────────
 function updateCharCount() {
   const len  = document.getElementById('message').value.length;
   const segs = len === 0 ? 0 : Math.ceil(len / SMS_RULES.SEGMENT);
@@ -470,10 +583,9 @@ function updateCharCount() {
   document.getElementById('sendBtn').disabled = over || len === 0;
 }
 
-// ── フォーム送信 → 確認モーダル ──────────────────────────────────────
+// ── フォーム送信 → 確認モーダル ──────────────────────────────────
 function handleFormSubmit(e) {
   e.preventDefault();
-
   const cc   = document.getElementById('countryCode').value;
   let phone  = document.getElementById('phoneNumber').value.trim();
   if (phone.startsWith('0')) phone = phone.slice(1);
@@ -488,10 +600,9 @@ function handleFormSubmit(e) {
   document.getElementById('modal').classList.remove('hidden');
 }
 
-// ── 確認後の実送信 ────────────────────────────────────────────────────
+// ── 確認後の実送信 ────────────────────────────────────────────────
 async function handleConfirm() {
   document.getElementById('modal').classList.add('hidden');
-
   const cc   = document.getElementById('countryCode').value;
   let phone  = document.getElementById('phoneNumber').value.trim();
   if (phone.startsWith('0')) phone = phone.slice(1);
@@ -500,7 +611,6 @@ async function handleConfirm() {
 
   showSpinner(true);
   try {
-    // account はペイロードに含めない。サーバがログインメールから自動決定する。
     const data = await callApi('sendSms', { to, text });
     showSpinner(false);
     if (data.ok) {
@@ -508,7 +618,12 @@ async function handleConfirm() {
       updateCharCount();
       showToast('送信しました (' + data.result.segments + ' SMS)', 'success');
     } else {
-      showToast('エラー: ' + data.error, 'error');
+      if (/有効期限|再ログイン/.test(data.error || '')) {
+        showToast(data.error, 'error');
+        setTimeout(() => signOut(), 2000);
+      } else {
+        showToast(data.error || '送信できませんでした', 'error');
+      }
     }
   } catch (err) {
     showSpinner(false);
@@ -516,15 +631,14 @@ async function handleConfirm() {
   }
 }
 
-// ── ping テスト（疎通確認。実 SMS は送らない） ────────────────────────
+// ── ping テスト（実SMS送らない） ──────────────────────────────────
 async function pingTest() {
-  if (!idToken) { showToast('ログインしてください', 'error'); return; }
   showSpinner(true);
   try {
     const data = await callApi('ping', {});
     showSpinner(false);
     if (data.ok) {
-      showToast(`ping OK: ${data.result.user} (${data.result.label})`, 'success');
+      showToast(`ping OK: ${data.result.id || '?'} (${data.result.label || '?'})`, 'success');
     } else {
       showToast('ping エラー: ' + data.error, 'error');
     }
@@ -534,31 +648,22 @@ async function pingTest() {
   }
 }
 
-// ── GAS Web App API 呼び出し ──────────────────────────────────────────
+// ── GAS Web App API 呼び出し ──────────────────────────────────────
 async function callApi(action, payload) {
-  if (!idToken) {
-    if (typeof google !== 'undefined' && google.accounts) google.accounts.id.prompt();
-    throw new Error('未ログイン');
+  const body = { action, ...payload };
+  // login/verifyOtp 以外はトークンを付与
+  if (token && action !== 'login' && action !== 'verifyOtp') {
+    body.token = token;
   }
   const res = await fetch(WEBAPP_URL, {
     method:  'POST',
-    // text/plain: CORS preflight を回避（GAS は OPTIONS に対応しないため）
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body:    JSON.stringify({ action, idToken, ...payload })
+    body:    JSON.stringify(body)
   });
-  const data = await res.json();
-  // トークン期限切れ等 → サインイン画面へ誘導
-  if (!data.ok && /ログイン|トークン|aud|許可/.test(data.error || '')) {
-    idToken     = null;
-    userAccount = null;
-    userLabel   = null;
-    if (typeof google !== 'undefined' && google.accounts) google.accounts.id.prompt();
-    renderApp();
-  }
-  return data;
+  return res.json();
 }
 
-// ── UI ヘルパー ───────────────────────────────────────────────────────
+// ── UI ヘルパー ───────────────────────────────────────────────────
 function showSpinner(visible) {
   document.getElementById('spinner-overlay').classList.toggle('hidden', !visible);
 }
@@ -570,6 +675,10 @@ function showToast(msg, type = '') {
   el.className = 'show' + (type ? ' ' + type : '');
   clearTimeout(_toastTimer);
   _toastTimer = setTimeout(() => { el.className = ''; }, 4000);
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 </script>
 </body>
