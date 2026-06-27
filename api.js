@@ -4,6 +4,10 @@
 
 var SMS_RULES = { SEGMENT: 70, MAX: 660 };
 
+// 利用権判定: kaihipay_status の有効値（ホワイトリスト）
+// 未知の値を誤って有効にしないよう明示一致のみ有効
+var KAIHI_ACTIVE_VALUES = ['active'];
+
 function doPost(e) {
   var action = '-';
   try {
@@ -36,16 +40,14 @@ function handleLogin_(body) {
   var member = id ? getMember_(id) : null;
 
   // 固定時間パスワード照合（タイミング攻撃対策: 必ずsafeEqual_を通す）
-  var storedPw = member ? decodeBase64Str_(member.pw) : '';
-  var pwOk     = safeEqual_(storedPw, pw);
+  var storedPw   = member ? decodeBase64Str_(member.pw) : '';
+  // 空pwガード: 格納pwが空なら入力に関わらず必ず失敗（空==空の偽陽性を防ぐ）
+  var pwNonEmpty = storedPw.length > 0;
+  var pwOk       = pwNonEmpty && safeEqual_(storedPw, pw);
 
-  var isValid = member &&
-    pwOk &&
-    member.flag === 'TRUE' &&
-    member.email &&
-    isValidExpiry_(member.expiry) &&
-    isValidStatus_(member.payment_status) &&
-    isValidStatus_(member.kaihipay_status);
+  // entitled = license_valid && (kaihiActive || grandfathered)
+  // flag・payment_status(GMO廃止残骸)は判定に使わない
+  var isValid = member && pwOk && member.email && isEntitled_(member);
 
   // 失敗理由は一切区別しない
   if (!isValid) {
@@ -87,13 +89,9 @@ function handleSendSms_(body) {
   var claims = verifyToken_(body.token);
   var id     = claims.id;
 
-  // 会員有効性を都度再チェック
+  // 会員有効性を都度再チェック（entitled = license_valid && (kaihiActive || grandfathered)）
   var member = getMember_(id);
-  if (!member ||
-      member.flag !== 'TRUE' ||
-      !isValidExpiry_(member.expiry) ||
-      !isValidStatus_(member.payment_status) ||
-      !isValidStatus_(member.kaihipay_status)) {
+  if (!member || !isEntitled_(member)) {
     throw new Error('ご契約が有効でないか、送信権限がありません');
   }
 
@@ -196,10 +194,13 @@ function getMember_(id) {
         id:              String(data[r][col['id']]),
         pw:              String(data[r][col['pw']]),
         email:           String(data[r][col['email']]),
-        flag:            String(data[r][col['flag']]).toUpperCase().trim(),
+        flag:            String(data[r][col['flag']] || ''),            // 参照のみ・判定に使わない
         expiry:          data[r][col['expiry']],
-        payment_status:  String(data[r][col['payment_status']]),
-        kaihipay_status: String(data[r][col['kaihipay_status']])
+        payment_status:  String(data[r][col['payment_status']] || ''), // GMO廃止残骸・判定に使わない
+        kaihipay_status: String(data[r][col['kaihipay_status']] || ''),
+        role:            col['role'] !== undefined                      // grandfathered 判定に使用
+                           ? String(data[r][col['role']] || '')
+                           : ''
       };
     }
   }
@@ -410,12 +411,20 @@ function isValidExpiry_(expiry) {
   return !isNaN(d.getTime()) && d > new Date();
 }
 
-function isValidStatus_(status) {
+// kaihipay_status のホワイトリスト判定（未知の値を誤って有効にしないよう明示一致）
+function isKaihiActive_(status) {
   var s = String(status || '').trim().toLowerCase();
-  if (!s) return false;
-  var invalid = ['false', 'invalid', 'expired', 'inactive', '0', 'no',
-                 '無効', 'cancelled', 'canceled', 'unpaid', 'overdue'];
-  return invalid.indexOf(s) === -1;
+  return KAIHI_ACTIVE_VALUES.indexOf(s) !== -1;
+}
+
+// 利用権判定: entitled = license_valid && (kaihiActive || grandfathered)
+// flag（実行中フラグ）・payment_status（GMO廃止残骸）は参照しない
+function isEntitled_(member) {
+  if (!member) return false;
+  if (!isValidExpiry_(member.expiry)) return false;
+  var kaihiActive   = isKaihiActive_(member.kaihipay_status);
+  var grandfathered = String(member.role || '').trim() === 'grandfathered';
+  return kaihiActive || grandfathered;
 }
 
 function normalizePhone_(raw) {

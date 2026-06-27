@@ -1,4 +1,11 @@
-// test.gs — Phase4 ログインロジック単体テスト（GASエディタから手動実行）
+// test.js — Phase4-fix ログインロジック単体テスト（GASエディタから手動実行）
+//
+// 判定基準: entitled = license_valid && (kaihiActive || grandfathered)
+//   - flag は参照しない（実行中フラグ）
+//   - payment_status は参照しない（GMO廃止残骸）
+//   - kaihipay_status はホワイトリスト（'active' のみ有効）
+//   - role === 'grandfathered' なら kaihipay 判定をスキップして有効
+//   - 格納pwが空なら入力に関わらず必ず失敗（空pw認証バイパス防止）
 //
 // 事前準備:
 //   スクリプトプロパティ "TEST_PW_TF" に tokyoflower の平文パスワードを設定すること。
@@ -34,14 +41,16 @@ function testLogin_tokyoflower() {
   }
   Logger.log('  OK: 行を発見');
   Logger.log('  email          : ' + member.email);
-  Logger.log('  flag           : "' + member.flag + '"');
   Logger.log('  expiry         : ' + member.expiry);
-  Logger.log('  payment_status : "' + member.payment_status + '"');
   Logger.log('  kaihipay_status: "' + member.kaihipay_status + '"');
+  Logger.log('  role           : "' + member.role + '"');
   Logger.log('  pw 列 設定あり  : ' + (member.pw ? 'YES' : 'NO (空)'));
+  Logger.log('  --- 判定に使わない列（参照のみ） ---');
+  Logger.log('  flag           : "' + member.flag + '" ← 実行中フラグ・利用権判定に不使用');
+  Logger.log('  payment_status : "' + member.payment_status + '" ← GMO廃止残骸・利用権判定に不使用');
 
-  // ── STEP 2: Base64デコード → パスワード照合（固定時間比較） ──
-  Logger.log('\n[STEP 2] Base64デコード + safeEqual_() によるpw照合');
+  // ── STEP 2: pw 照合 ────────────────────────────────────────────
+  Logger.log('\n[STEP 2] pw照合（空pwガード + 固定時間 safeEqual_）');
   var storedPw = '';
   try {
     storedPw = decodeBase64Str_(member.pw);
@@ -52,37 +61,45 @@ function testLogin_tokyoflower() {
   var storedLen = storedPw.length;
   var inputLen  = TEST_PW.length;
   Logger.log('  格納pw の文字数: ' + storedLen + ' / 入力pw の文字数: ' + inputLen);
-  var pwOk = safeEqual_(storedPw, TEST_PW);
-  Logger.log('  結果: ' + (pwOk ? 'OK: 一致' : 'FAIL: 不一致（文字数または内容が違う）'));
 
-  // ── STEP 3: flag チェック ──────────────────────────────────────
-  Logger.log('\n[STEP 3] flag チェック（期待値: "TRUE"）');
-  var flagOk = member.flag === 'TRUE';
-  Logger.log('  flag 値: "' + member.flag + '"');
-  Logger.log('  結果: ' + (flagOk ? 'OK' : 'FAIL: "TRUE" ではない'));
+  // 空pwガード: 格納pwが空なら入力に関わらず必ず失敗
+  var pwNonEmpty = storedLen > 0;
+  if (!pwNonEmpty) {
+    Logger.log('  空pwガード: FAIL — 格納pwが空です（シートの pw 列に Base64エンコードしたpwを設定してください）');
+  }
+  var pwMatch = safeEqual_(storedPw, TEST_PW);
+  var pwOk    = pwNonEmpty && pwMatch;
+  Logger.log('  空pwガード: ' + (pwNonEmpty ? 'OK（格納pw非空）' : 'FAIL（格納pw空）'));
+  Logger.log('  safeEqual_: ' + (pwMatch ? 'OK: 一致' : 'FAIL: 不一致（文字数または内容が違う）'));
+  Logger.log('  結果: ' + (pwOk ? 'OK' : 'FAIL'));
 
-  // ── STEP 4: expiry チェック ────────────────────────────────────
-  Logger.log('\n[STEP 4] expiry チェック（期待値: 今日より未来の日付）');
+  // ── STEP 3: expiry チェック（ライセンス有効期限） ─────────────
+  Logger.log('\n[STEP 3] expiry チェック（ライセンス有効期限 / 未来日付であること）');
   var expiryOk = isValidExpiry_(member.expiry);
-  var now = new Date();
-  Logger.log('  現在日時   : ' + now);
+  Logger.log('  現在日時   : ' + new Date());
   Logger.log('  expiry 値  : ' + member.expiry);
   Logger.log('  結果: ' + (expiryOk ? 'OK: 有効期限内' : 'FAIL: 期限切れまたは日付が不正'));
 
-  // ── STEP 5: payment_status チェック ───────────────────────────
-  Logger.log('\n[STEP 5] payment_status チェック');
-  var payOk = isValidStatus_(member.payment_status);
-  Logger.log('  payment_status 値: "' + member.payment_status + '"');
-  Logger.log('  isValidStatus_ の判定: ' + (payOk ? 'OK: 有効' : 'FAIL: 無効値と判定'));
-  if (!payOk) {
-    Logger.log('  → isValidStatus_ が false を返す値: false/invalid/expired/inactive/0/no/無効/cancelled/canceled/unpaid/overdue');
-  }
-
-  // ── STEP 6: kaihipay_status チェック ──────────────────────────
-  Logger.log('\n[STEP 6] kaihipay_status チェック');
-  var kaihiOk = isValidStatus_(member.kaihipay_status);
+  // ── STEP 4: kaihipay_status チェック（ホワイトリスト判定） ────
+  Logger.log('\n[STEP 4] kaihipay_status チェック（ホワイトリスト: ' + KAIHI_ACTIVE_VALUES.join(', ') + '）');
+  var kaihiOk = isKaihiActive_(member.kaihipay_status);
   Logger.log('  kaihipay_status 値: "' + member.kaihipay_status + '"');
-  Logger.log('  isValidStatus_ の判定: ' + (kaihiOk ? 'OK: 有効' : 'FAIL: 無効値と判定'));
+  Logger.log('  有効値リスト: [' + KAIHI_ACTIVE_VALUES.map(function(v){ return '"' + v + '"'; }).join(', ') + ']');
+  Logger.log('  結果: ' + (kaihiOk ? 'OK: 有効値に一致' : 'FAIL: 有効値に一致しない'));
+
+  // ── STEP 5: role / grandfathered チェック ─────────────────────
+  Logger.log('\n[STEP 5] role チェック（grandfathered なら kaihipay 判定をスキップして有効）');
+  var grandfathered = String(member.role || '').trim() === 'grandfathered';
+  Logger.log('  role 値: "' + member.role + '"');
+  Logger.log('  grandfathered: ' + (grandfathered ? 'YES → kaihipay 判定スキップ・有効扱い' : 'NO → kaihipay で判定'));
+
+  // ── STEP 6: entitled 判定 ─────────────────────────────────────
+  Logger.log('\n[STEP 6] entitled 判定（license_valid && (kaihiActive || grandfathered)）');
+  var entitledOk = isEntitled_(member);
+  Logger.log('  expiry_ok    : ' + (expiryOk    ? '✓' : '✗'));
+  Logger.log('  kaihi_ok     : ' + (kaihiOk     ? '✓' : '✗'));
+  Logger.log('  grandfathered: ' + (grandfathered ? '✓' : '✗'));
+  Logger.log('  → isEntitled_: ' + (entitledOk ? 'OK: 有効' : 'FAIL: 無効'));
 
   // ── STEP 7: email 存在確認 ─────────────────────────────────────
   Logger.log('\n[STEP 7] email 存在確認');
@@ -91,23 +108,11 @@ function testLogin_tokyoflower() {
   Logger.log('  結果: ' + (emailOk ? 'OK' : 'FAIL: email が空またはフォーマット不正'));
 
   // ── STEP 8: 総合判定 ──────────────────────────────────────────
-  Logger.log('\n[STEP 8] 総合判定');
-  var checks = {
-    'pw照合'     : pwOk,
-    'flag'       : flagOk,
-    'expiry'     : expiryOk,
-    'payment'    : payOk,
-    'kaihi'      : kaihiOk,
-    'email'      : emailOk
-  };
-  var allOk = true;
-  var summary = [];
-  for (var k in checks) {
-    var v = checks[k];
-    summary.push(k + ': ' + (v ? '✓' : '✗'));
-    if (!v) allOk = false;
-  }
-  Logger.log('  ' + summary.join(' / '));
+  Logger.log('\n[STEP 8] 総合判定（pw_ok && entitled && email）');
+  var allOk = pwOk && entitledOk && emailOk;
+  Logger.log('  pw照合    : ' + (pwOk       ? '✓' : '✗') +
+             ' / entitled: ' + (entitledOk  ? '✓' : '✗') +
+             ' / email   : ' + (emailOk     ? '✓' : '✗'));
 
   if (allOk) {
     Logger.log('  → 全チェック通過。実際の handleLogin_ を呼べばOTPが送信されるはず。');
@@ -132,7 +137,7 @@ function testLogin_tokyoflower() {
       Logger.log('  ERROR: ' + e.message);
     }
   } else {
-    Logger.log('  → ログイン失敗。上記 ✗ の項目を修正してください。');
+    Logger.log('  → ログイン失敗。上記 ✗ の項目を確認してください。');
     Logger.log('  ※ 本番エラーメッセージは曖昧化（理由を区別しない）が仕様です。');
   }
 
