@@ -2,390 +2,327 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0C6B43" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0B120E" media="(prefers-color-scheme: dark)">
   <title>SMS送信侍</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Kosugi+Maru&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Space+Grotesk:wght@500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
   <style>
-    :root {
-      --primary:      #007BFF;
-      --primary-dark: #0056b3;
-      --bg:           #f5f5f5;
-      --card:         #fff;
-      --border:       #ccc;
-      --text:         #333;
-      --sub:          #666;
-      --danger:       #dc3545;
-      --success:      #28a745;
-      --radius:       8px;
+    :root{
+      --bg:#EDF0ED; --surface:#FFFFFF; --surface-2:#F6F8F6;
+      --border:#D7DED9; --ink:#14201A; --muted:#5C6B62;
+      --brand:#0C6B43; --brand-strong:#0A5837; --brand-tint:#E4F1EA;
+      --gold:#9A7B33; --danger:#C2341D; --danger-tint:#F8E6E2; --focus:#1FA06A;
+      --font-ui:'Noto Sans JP', system-ui, -apple-system, sans-serif;
+      --font-display:'Space Grotesk','Noto Sans JP', sans-serif;
+      --font-mono:'Space Mono', ui-monospace, 'SFMono-Regular', monospace;
+      --r-card:12px; --r-field:9px; --r-chip:7px;
+      --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px;
+      --maxw:480px;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-
-    body {
-      font-family: 'Kosugi Maru', sans-serif;
-      background: var(--bg);
-      font-size: 18px;
-      line-height: 1.6;
-      min-height: 100vh;
-    }
-
-    header {
-      background: var(--primary);
-      color: #fff;
-      padding: 14px 20px;
-      text-align: center;
-    }
-    header h1 { font-size: 20px; letter-spacing: .05em; }
-
-    .container {
-      max-width: 600px;
-      margin: 0 auto;
-      padding: 14px 12px;
+    @media (prefers-color-scheme:dark){
+      :root{
+        --bg:#0B120E; --surface:#121C16; --surface-2:#16221B;
+        --border:#243530; --ink:#E8EFEA; --muted:#9CB0A6;
+        --brand:#2FB179; --brand-strong:#3CC489; --brand-tint:#15271E;
+        --gold:#C7A35A; --danger:#F0735B; --danger-tint:#2A1714; --focus:#34B27B;
+      }
     }
 
-    .card {
-      background: var(--card);
-      border-radius: var(--radius);
-      box-shadow: 0 2px 8px rgba(0,0,0,.1);
-      padding: 20px 18px;
+    *{box-sizing:border-box}
+    html,body{margin:0}
+    body{
+      font-family:var(--font-ui); color:var(--ink); background:var(--bg);
+      font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased;
+      min-height:100dvh;
     }
 
-    /* ── サインイン ─────────────────────────────── */
-    #signin-area .card {
-      text-align: center;
-      padding: 40px 20px;
+    /* ── Topbar ────────────────────────────────────── */
+    .topbar{
+      position:sticky; top:0; z-index:10;
+      display:flex; align-items:center; justify-content:space-between; gap:var(--s3);
+      padding:var(--s3) var(--s4); background:var(--surface);
+      border-bottom:1px solid var(--border);
     }
-    #signin-area p { color: var(--sub); margin-bottom: 24px; font-size: 16px; }
-    #signin-btn { display: inline-block; min-height: 44px; }
+    .brandmark{font-family:var(--font-display); font-weight:700; letter-spacing:.02em; font-size:18px; white-space:nowrap; flex-shrink:0}
+    .who{display:flex; align-items:center; gap:var(--s2); color:var(--muted); font-size:12px; min-width:0}
+    .who-dot{width:7px;height:7px;border-radius:50%;background:var(--brand);flex:none}
+    .who-mail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:46vw}
+    .btn-ghost{
+      font:inherit; font-size:12px; color:var(--muted); background:transparent;
+      border:1px solid var(--border); border-radius:var(--r-chip);
+      padding:6px 10px; cursor:pointer; white-space:nowrap;
+    }
+    .btn-ghost:hover{color:var(--ink); border-color:var(--muted)}
 
-    /* ── ユーザー情報バー ───────────────────────── */
-    #user-info {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 8px 16px;
-      background: var(--card);
-      border-bottom: 1px solid var(--border);
-      font-size: 13px;
-      color: var(--sub);
-    }
-    #signout-btn {
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      padding: 4px 12px;
-      font-size: 13px;
-      font-family: inherit;
-      cursor: pointer;
-      color: var(--sub);
-    }
-    #signout-btn:hover { background: var(--bg); }
-
-    /* ── 中央テキスト（ローディング・権限なし） ── */
-    .center-msg {
-      text-align: center;
-      color: var(--sub);
-      padding: 36px 0;
-      font-size: 16px;
-    }
-    #no-permission-area .center-msg { color: var(--danger); }
-
-    /* ── 送信元バッジ ───────────────────────────── */
-    #account-badge {
-      background: #e8f5e9;
-      border: 1px solid #a5d6a7;
-      border-radius: var(--radius);
-      padding: 10px 16px;
-      margin-bottom: 22px;
-      font-size: 15px;
-      color: var(--sub);
-    }
-    #account-badge strong {
-      display: block;
-      font-size: 19px;
-      color: #1b5e20;
-      margin-top: 2px;
+    /* ── Layout ────────────────────────────────────── */
+    .wrap{max-width:var(--maxw); margin:0 auto; padding:var(--s4)}
+    .card{
+      background:var(--surface); border:1px solid var(--border);
+      border-radius:var(--r-card); padding:var(--s5);
+      box-shadow:0 1px 0 rgba(20,32,26,.03);
     }
 
-    /* ── フォーム ───────────────────────────────── */
-    label {
-      display: block;
-      font-size: 14px;
-      font-weight: bold;
-      color: var(--sub);
-      margin: 18px 0 6px;
+    /* ── 送信元クレジット ───────────────────────────── */
+    .sender{
+      position:relative; display:flex; align-items:center; gap:var(--s3);
+      background:var(--brand-tint); border:1px solid color-mix(in srgb,var(--brand) 22%,transparent);
+      border-radius:var(--r-chip); padding:var(--s3) var(--s4) var(--s3) var(--s5);
+      overflow:hidden; margin-bottom:var(--s5);
     }
-    label:first-of-type { margin-top: 0; }
+    .sender::before{content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--brand)}
+    .sender-label{font-family:var(--font-mono); font-size:11px; letter-spacing:.12em;
+      text-transform:uppercase; color:var(--brand-strong); margin-bottom:2px}
+    .sender-name{font-family:var(--font-display); font-weight:700; font-size:20px; color:var(--ink); line-height:1.1}
+    .sender-check{margin-left:auto; color:var(--brand); font-size:14px; flex:none}
 
-    select,
-    input[type="tel"],
-    textarea {
-      width: 100%;
-      padding: 12px;
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      font-size: 17px;
-      font-family: inherit;
-      outline: none;
-      transition: border-color .15s;
-      background: var(--card);
+    /* ── フィールド ────────────────────────────────── */
+    .field{margin-bottom:var(--s4)}
+    .eyebrow{font-family:var(--font-mono); font-size:11px; letter-spacing:.12em;
+      text-transform:uppercase; color:var(--muted); margin-bottom:6px}
+    .row{display:flex; gap:var(--s2)}
+    .select,.input,.textarea{
+      width:100%; font-family:var(--font-ui); font-size:15px; color:var(--ink);
+      background:var(--surface-2); border:1px solid var(--border);
+      border-radius:var(--r-field); padding:12px 14px; min-height:44px;
     }
-    select:focus, input:focus, textarea:focus { border-color: var(--primary); }
-    textarea { resize: vertical; min-height: 130px; }
+    .select{flex:0 0 42%}
+    .input{font-family:var(--font-mono); letter-spacing:.02em; flex:1}
+    .textarea{min-height:128px; resize:vertical; line-height:1.6}
+    .select:focus,.input:focus,.textarea:focus{
+      outline:none; border-color:var(--focus);
+      box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 25%,transparent);
+    }
+    .meter{font-family:var(--font-mono); font-size:12px; color:var(--muted);
+      text-align:right; margin-top:6px}
+    .meter.over{color:var(--danger)}
 
-    .textarea-wrap { position: relative; }
-    #charCount {
-      position: absolute;
-      bottom: 10px;
-      right: 10px;
-      font-size: 12px;
-      color: var(--sub);
-      pointer-events: none;
+    /* ── 送信ボタン ────────────────────────────────── */
+    .btn-send{
+      width:100%; font:inherit; font-weight:700; font-size:16px;
+      color:#fff; background:var(--brand); border:0; border-radius:var(--r-field);
+      padding:15px; min-height:50px; cursor:pointer; margin-top:var(--s2);
+      transition:transform .06s ease, background .15s ease;
     }
-    #charCount.over { color: var(--danger); font-weight: bold; }
+    .btn-send:hover{background:var(--brand-strong)}
+    .btn-send:active{transform:scale(.985)}
+    .btn-send:disabled{background:var(--border); color:var(--muted); cursor:not-allowed}
 
-    #sendBtn {
-      width: 100%;
-      background: var(--primary);
-      color: #fff;
-      border: none;
-      border-radius: var(--radius);
-      padding: 16px;
-      font-size: 18px;
-      font-family: inherit;
-      cursor: pointer;
-      margin-top: 22px;
-      transition: background .15s;
+    /* ── Ping link ─────────────────────────────────── */
+    #ping-link{
+      display:block; text-align:right; font-size:12px;
+      color:var(--muted); margin-top:var(--s3);
+      cursor:pointer; text-decoration:underline;
     }
-    #sendBtn:hover:not(:disabled) { background: var(--primary-dark); }
-    #sendBtn:disabled { background: var(--border); cursor: not-allowed; }
+    #ping-link:hover{color:var(--ink)}
 
-    #ping-link {
-      display: block;
-      text-align: right;
-      font-size: 12px;
-      color: var(--sub);
-      margin-top: 10px;
-      cursor: pointer;
-      text-decoration: underline;
+    /* ── フッター ───────────────────────────────────── */
+    .foot{
+      max-width:var(--maxw); margin:var(--s5) auto 0;
+      padding:0 var(--s4) var(--s6);
+      text-align:center; color:var(--muted); font-size:12px; line-height:1.7;
     }
-    #ping-link:hover { color: var(--text); }
+    .foot .latin{font-family:var(--font-display); letter-spacing:.02em; color:var(--ink)}
+    .foot .sep{opacity:.5; margin:0 6px}
 
-    /* ── 確認モーダル ───────────────────────────── */
-    .modal-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,.5);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 100;
-      padding: 16px;
-    }
-    .modal-card {
-      background: var(--card);
-      border-radius: var(--radius);
-      padding: 24px 20px;
-      width: 100%;
-      max-width: 480px;
-      max-height: 90vh;
-      overflow-y: auto;
-    }
-    .modal-card h2 { font-size: 19px; margin-bottom: 18px; }
+    /* ── サインイン画面 ────────────────────────────── */
+    .signin{max-width:380px; margin:14vh auto 0; padding:var(--s4); text-align:center}
+    .signin .card{padding:var(--s6)}
+    .signin h1{font-family:var(--font-display); font-weight:700; font-size:18px; margin:0 0 var(--s3)}
+    .signin p{color:var(--muted); font-size:14px; margin:0 0 var(--s5)}
 
-    .modal-field { margin-bottom: 14px; }
-    .modal-field strong {
-      display: block;
-      font-size: 12px;
-      color: var(--sub);
-      margin-bottom: 3px;
-    }
-    .modal-field span { font-size: 16px; }
+    /* ── 中央メッセージ ─────────────────────────────── */
+    .center-msg{text-align:center; color:var(--muted); padding:var(--s6) var(--s4); font-size:14px}
 
-    #modal-text {
-      background: #f8f8f8;
-      border-radius: 4px;
-      padding: 10px 12px;
-      font-size: 15px;
-      white-space: pre-wrap;
-      word-break: break-all;
-      max-height: 180px;
-      overflow-y: auto;
-      margin-top: 3px;
+    /* ── トースト ───────────────────────────────────── */
+    #toast{
+      position:fixed; left:50%; bottom:24px;
+      transform:translateX(-50%) translateY(120px);
+      padding:12px 18px; border-radius:999px; color:#fff;
+      font-size:14px; font-weight:500; background:#333;
+      box-shadow:0 6px 24px rgba(0,0,0,.18); z-index:50;
+      transition:transform .28s ease; pointer-events:none;
     }
+    #toast.show{transform:translateX(-50%) translateY(0)}
+    #toast.show.success{background:var(--brand)}
+    #toast.show.error{background:var(--danger)}
 
-    .modal-actions { display: flex; gap: 12px; margin-top: 22px; }
-    .modal-actions button {
-      flex: 1;
-      padding: 14px;
-      border-radius: var(--radius);
-      font-size: 16px;
-      font-family: inherit;
-      cursor: pointer;
-      border: none;
+    /* ── 確認モーダル ───────────────────────────────── */
+    .modal-bg{
+      position:fixed; inset:0; background:rgba(10,18,14,.5);
+      display:flex; align-items:center; justify-content:center;
+      padding:var(--s4); z-index:40;
     }
-    #cancelBtn { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
-    #confirmBtn { background: var(--primary); color: #fff; }
-    #confirmBtn:hover { background: var(--primary-dark); }
+    .modal-inner{
+      background:var(--surface); border:1px solid var(--border);
+      border-radius:var(--r-card); padding:var(--s5);
+      width:100%; max-width:360px;
+    }
+    .modal-inner h2{
+      font-family:var(--font-display); font-weight:700; font-size:17px;
+      margin:0 0 var(--s4);
+    }
+    .modal-field{margin-bottom:var(--s3)}
+    .modal-actions{display:flex; gap:var(--s2); margin-top:var(--s5)}
+    .modal-actions .btn-ghost{flex:1; padding:12px; font-size:15px; border-radius:var(--r-field)}
+    .modal-actions .btn-send{flex:1; margin-top:0}
 
-    /* ── スピナー ───────────────────────────────── */
-    #spinner-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(255,255,255,.72);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 200;
+    /* ── スピナー ───────────────────────────────────── */
+    #spinner-overlay{
+      position:fixed; inset:0; background:rgba(255,255,255,.75);
+      display:flex; align-items:center; justify-content:center; z-index:200;
     }
-    .spinner {
-      width: 46px;
-      height: 46px;
-      border: 5px solid var(--border);
-      border-top-color: var(--primary);
-      border-radius: 50%;
-      animation: spin .8s linear infinite;
+    @media (prefers-color-scheme:dark){
+      #spinner-overlay{background:rgba(11,18,14,.8)}
     }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner{
+      width:40px; height:40px;
+      border:4px solid var(--border); border-top-color:var(--brand);
+      border-radius:50%; animation:spin .8s linear infinite;
+    }
+    @keyframes spin{to{transform:rotate(360deg)}}
 
-    /* ── トースト ───────────────────────────────── */
-    #toast {
-      position: fixed;
-      bottom: 28px;
-      left: 50%;
-      transform: translateX(-50%) translateY(120px);
-      background: #333;
-      color: #fff;
-      padding: 14px 24px;
-      border-radius: 28px;
-      font-size: 15px;
-      max-width: 80vw;
-      text-align: center;
-      transition: transform .28s ease;
-      z-index: 300;
-      pointer-events: none;
-    }
-    #toast.show    { transform: translateX(-50%) translateY(0); }
-    #toast.success { background: var(--success); }
-    #toast.error   { background: var(--danger); }
+    .hidden{display:none !important}
 
-    .hidden { display: none !important; }
+    @media (prefers-reduced-motion:reduce){
+      *{animation-duration:.001ms !important; transition-duration:.001ms !important}
+    }
   </style>
 </head>
 <body>
 
-<header>
-  <h1>SMS送信侍</h1>
-</header>
-
-<!-- ── サインイン画面 ──────────────────────────────────── -->
+<!-- ── サインイン画面 ─────────────────────────────────────────── -->
 <div id="signin-area">
-  <div class="container">
+  <div class="signin">
     <div class="card">
-      <p>Google アカウントでログインしてください</p>
+      <h1>SMS送信侍</h1>
+      <p>Googleアカウントでログイン</p>
       <div id="signin-btn"></div>
     </div>
   </div>
 </div>
 
-<!-- ── アプリ画面（ログイン後） ──────────────────────── -->
+<!-- ── アプリ画面（ログイン後） ─────────────────────────────── -->
 <div id="app-area" class="hidden">
-  <div id="user-info">
-    <span>ログイン中: <span id="user-email"></span></span>
-    <button id="signout-btn">ログアウト</button>
-  </div>
 
-  <div class="container">
-    <div class="card">
+  <!-- Sticky topbar -->
+  <header class="topbar">
+    <span class="brandmark">SMS送信侍</span>
+    <div class="who">
+      <span class="who-dot"></span>
+      <span class="who-mail" id="user-email"></span>
+      <button class="btn-ghost" id="signout-btn">ログアウト</button>
+    </div>
+  </header>
 
-      <!-- アカウント確認中 -->
-      <div id="checking-area" class="hidden">
-        <p class="center-msg">アカウント確認中...</p>
+  <div class="wrap">
+
+    <!-- アカウント確認中 -->
+    <div id="checking-area" class="hidden">
+      <p class="center-msg">アカウント確認中...</p>
+    </div>
+
+    <!-- 権限なし -->
+    <div id="no-permission-area" class="hidden">
+      <div class="card" style="text-align:center;padding:var(--s6)">
+        <p style="color:var(--danger);margin-bottom:var(--s2)">このアカウントには送信権限がありません</p>
+        <p style="font-size:13px;color:var(--muted)">管理者に連絡してください</p>
       </div>
+    </div>
 
-      <!-- 権限なし -->
-      <div id="no-permission-area" class="hidden">
-        <div class="center-msg">
-          <p>このアカウントには送信権限がありません</p>
-          <p style="font-size:13px;margin-top:8px;">管理者に連絡してください</p>
-        </div>
-      </div>
+    <!-- フォーム（アカウント確定後） -->
+    <div id="form-section" class="hidden">
+      <div class="card">
 
-      <!-- フォーム（アカウント確定後に表示） -->
-      <div id="form-section" class="hidden">
-
-        <!-- 送信元（読み取り専用） -->
-        <div id="account-badge">
-          <span>送信元</span>
-          <strong id="account-label"></strong>
+        <!-- 送信元クレジット -->
+        <div class="sender" id="account-badge">
+          <div>
+            <div class="sender-label">送信元 · SENDER</div>
+            <div class="sender-name" id="account-label"></div>
+          </div>
+          <span class="sender-check">✓</span>
         </div>
 
         <form id="smsForm">
-          <label for="countryCode">国番号</label>
-          <select id="countryCode" name="countryCode"></select>
 
-          <label for="phoneNumber">電話番号</label>
-          <input
-            type="tel"
-            id="phoneNumber"
-            name="phoneNumber"
-            placeholder="080xxxxxxxx"
-            inputmode="numeric"
-            required
-          >
-
-          <label for="message">メッセージ</label>
-          <div class="textarea-wrap">
-            <textarea id="message" name="message" rows="5" required></textarea>
-            <div id="charCount">0 / 660 (0 SMS)</div>
+          <!-- 宛先 -->
+          <div class="field">
+            <div class="eyebrow">宛先 · TO</div>
+            <div class="row">
+              <select id="countryCode" name="countryCode" class="select"></select>
+              <input
+                type="tel"
+                id="phoneNumber"
+                name="phoneNumber"
+                class="input"
+                placeholder="080xxxxxxxx"
+                inputmode="numeric"
+                required
+              >
+            </div>
           </div>
 
-          <button type="submit" id="sendBtn" disabled>送信</button>
+          <!-- 本文 -->
+          <div class="field">
+            <div class="eyebrow">本文 · MESSAGE</div>
+            <textarea id="message" name="message" class="textarea" rows="5" required></textarea>
+            <div class="meter" id="charCount">0 / 660 (0 SMS)</div>
+          </div>
+
+          <button type="submit" id="sendBtn" class="btn-send" disabled>送信する</button>
         </form>
 
         <span id="ping-link">疎通確認 (ping)</span>
       </div>
-
     </div>
+
   </div>
+
+  <!-- フッター -->
+  <footer class="foot">
+    A GSD tool<span class="sep">·</span>powered by <span class="latin">Ginza TOKYOFLOWER</span>
+  </footer>
+
 </div>
 
-<!-- ── 送信確認モーダル ──────────────────────────────── -->
-<div id="modal" class="modal-overlay hidden">
-  <div class="modal-card">
+<!-- ── 送信確認モーダル ─────────────────────────────────────── -->
+<div id="modal" class="modal-bg hidden">
+  <div class="modal-inner">
     <h2>送信確認</h2>
     <div class="modal-field">
-      <strong>送信元</strong>
+      <div class="eyebrow">送信元</div>
       <span id="modal-account"></span>
     </div>
     <div class="modal-field">
-      <strong>宛先</strong>
-      <span id="modal-to"></span>
+      <div class="eyebrow">宛先</div>
+      <span id="modal-to" style="font-family:var(--font-mono)"></span>
     </div>
     <div class="modal-field">
-      <strong>メッセージ</strong>
-      <div id="modal-text"></div>
+      <div class="eyebrow">メッセージ</div>
+      <div id="modal-text" style="background:var(--surface-2);border-radius:var(--r-chip);padding:var(--s3);font-size:14px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow-y:auto;margin-top:4px"></div>
     </div>
     <div class="modal-field">
-      <strong>送信数</strong>
-      <span id="modal-segments"></span>
+      <div class="eyebrow">送信数</div>
+      <span id="modal-segments" style="font-family:var(--font-mono)"></span>
     </div>
     <div class="modal-actions">
-      <button id="cancelBtn">キャンセル</button>
-      <button id="confirmBtn">送信する</button>
+      <button id="cancelBtn" class="btn-ghost">キャンセル</button>
+      <button id="confirmBtn" class="btn-send">送信する</button>
     </div>
   </div>
 </div>
 
-<!-- ── スピナー ──────────────────────────────────────── -->
+<!-- ── スピナー ──────────────────────────────────────────────── -->
 <div id="spinner-overlay" class="hidden">
   <div class="spinner"></div>
 </div>
 
-<!-- ── トースト通知 ──────────────────────────────────── -->
+<!-- ── トースト通知 ──────────────────────────────────────────── -->
 <div id="toast"></div>
 
-<!-- ── スクリプト ────────────────────────────────────── -->
+<!-- ── スクリプト ────────────────────────────────────────────── -->
 <script src="./country-codes.js"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
