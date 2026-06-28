@@ -225,7 +225,7 @@ function sendSingleSMSFromForm(data) {
     appendSmsLog_({
       '送信日時': Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
       '会員ID': data.accountId,
-      'from': String(sender || '').replace(/^\+81/, '0'),
+      'from': normalizePhoneFrom_(sender),
       'to': normalizedTo, 'メッセージ内容': text,
       'ステータス': '送信成功', 'result_code': smsJson.result_code,
       'result_message': smsJson.result_message, 'message_id': smsJson.message_id,
@@ -246,7 +246,7 @@ function sendSingleSMSFromForm(data) {
     appendSmsLog_({
       '送信日時': Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
       '会員ID': String(data.accountId || ''),
-      'from': String(sender || '').replace(/^\+81/, '0'),
+      'from': normalizePhoneFrom_(sender),
       'to': normalizedTo || String(data.phoneNumber || ''),
       'メッセージ内容': String(data.message || ''),
       'ステータス': 'エラー', 'result_message': e.message
@@ -637,6 +637,15 @@ function normalizePhoneNumber_(raw, countryCode) {
   if (phone.indexOf(code) === 0) return phone;          // 81... はそのまま
   if (phone.charAt(0) === '0') return code + phone.substring(1); // 070... → 8170...
   return code + phone;                                  // 70... → 8170...
+}
+
+// ログ用: from を先頭0付き国内形式に正規化（形式不問）
+// +81335615787 → "0335615787" / 335615787 → "0335615787" / "0335615787" → そのまま
+function normalizePhoneFrom_(num) {
+  var s = String(num || '').trim().replace(/\s/g, '');
+  if (s.indexOf('+81') === 0) s = '0' + s.slice(3);
+  if (/^\d{8,10}$/.test(s) && s.charAt(0) !== '0') s = '0' + s;
+  return s;
 }
 
 function rateLimitCheck_(id) {
