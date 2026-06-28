@@ -16,11 +16,13 @@ function doPost(e) {
 
     var result;
     switch (action) {
-      case 'login':       result = handleLogin_(body);       break;
-      case 'verifyOtp':   result = handleVerifyOtp_(body);   break;
-      case 'sendSms':     result = handleSendSms_(body);     break;
-      case 'sendSmsForm': result = handleSendSmsForm_(body); break;
-      case 'ping':        result = handlePing_(body);        break;
+      case 'login':                result = handleLogin_(body);                break;
+      case 'verifyOtp':            result = handleVerifyOtp_(body);            break;
+      case 'verifyTrustedDevice':  result = handleVerifyTrustedDevice_(body);  break;
+      case 'registerTrustedDevice':result = handleRegisterTrustedDevice_(body);break;
+      case 'sendSms':              result = handleSendSms_(body);              break;
+      case 'sendSmsForm':          result = handleSendSmsForm_(body);          break;
+      case 'ping':                 result = handlePing_(body);                 break;
       default: throw new Error('unknown action: ' + action);
     }
     return json_({ ok: true, result: result });
@@ -53,6 +55,15 @@ function handleLogin_(body) {
   // 失敗理由は一切区別しない
   if (!isValid) {
     throw new Error('IDかパスワードが違うか、ご契約が有効でない可能性があります');
+  }
+
+  // otp_required チェック（sms_accounts 列がなければ TRUE 扱い・安全側）
+  var smsAcc = getSmsAccount_(id);
+  if (smsAcc && !smsAcc.otp_required) {
+    var exp = Math.floor(Date.now() / 1000) + 43200;
+    var tok = signToken_({ id: id, exp: exp });
+    logAudit_(id, 'login', '-', 'token_issued_direct');
+    return { stage: 'token_issued', token: tok, label: smsAcc.label };
   }
 
   var otp = generateOtp_();
@@ -305,11 +316,110 @@ function getSmsAccount_(id) {
         cpaas_secret:  String(data[r][col['cpaas_secret']]),
         cpaas_sender:  String(data[r][col['cpaas_sender']]),
         label:         String(data[r][col['label']]),
-        enabled:       String(data[r][col['enabled']]).toUpperCase().trim()
+        enabled:       String(data[r][col['enabled']]).toUpperCase().trim(),
+        // 列なし・空・TRUE以外 → true（安全側に倒す）
+        otp_required:  col['otp_required'] !== undefined
+                         ? String(data[r][col['otp_required']] || '').toUpperCase().trim() !== 'FALSE'
+                         : true
       };
     }
   }
   return null;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 信頼デバイス: 登録・照合・清掃
+// ────────────────────────────────────────────────────────────────────
+
+// 信頼デバイストークンの HMAC ハッシュ（TOKEN_SIGN_KEY で署名）
+function trustedDeviceHash_(raw) {
+  var key  = Utilities.newBlob(getProp_('TOKEN_SIGN_KEY')).getBytes();
+  var data = Utilities.newBlob(String(raw)).getBytes();
+  var sig  = Utilities.computeHmacSha256Signature(data, key);
+  return sig.map(function(b) {
+    return ('0' + (b & 0xff).toString(16)).slice(-2);
+  }).join('');
+}
+
+// 同一id の期限切れ信頼デバイス行を削除（肥大化防止）
+function cleanExpiredTrustedDevices_(id) {
+  try {
+    var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+    var sheet = ss.getSheetByName('trusted_devices');
+    if (!sheet) return;
+    var data = sheet.getDataRange().getValues();
+    var now  = new Date();
+    // 下から削除して行番号ずれを防ぐ
+    for (var r = data.length - 1; r >= 1; r--) {
+      if (String(data[r][0]).trim() !== String(id).trim()) continue;
+      if (now > new Date(data[r][2])) sheet.deleteRow(r + 1);
+    }
+  } catch (_) {}
+}
+
+// verifyTrustedDevice: 信頼トークン照合 → セッショントークン発行
+function handleVerifyTrustedDevice_(body) {
+  var id           = String(body.id || '').trim();
+  var trustedToken = String(body.trusted_token || '').trim();
+  if (!id || !trustedToken) throw new Error('認証情報が不正です');
+
+  cleanExpiredTrustedDevices_(id); // 古いレコードを先に清掃
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('trusted_devices');
+  if (!sheet) throw new Error('認証情報が不正です');
+
+  var data = sheet.getDataRange().getValues();
+  var now  = new Date();
+  var hash = trustedDeviceHash_(trustedToken);
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][0]).trim() !== id) continue;
+    if (!safeEqual_(String(data[r][1]), hash)) continue;
+    if (now > new Date(data[r][2])) {
+      sheet.deleteRow(r + 1);
+      throw new Error('認証情報が不正です'); // 曖昧エラー
+    }
+    // 有効 → 会員有効性を再確認
+    var member = getMember_(id);
+    if (!member || !isEntitled_(member))
+      throw new Error('ご契約が有効でないか、送信権限がありません');
+
+    var exp    = Math.floor(Date.now() / 1000) + 43200;
+    var token  = signToken_({ id: id, exp: exp });
+    var smsAcc = getSmsAccount_(id);
+    var label  = smsAcc ? smsAcc.label : id;
+
+    logAudit_(id, 'verifyTrustedDevice', '-', 'ok');
+    return { token: token, label: label };
+  }
+  throw new Error('認証情報が不正です'); // 曖昧エラー
+}
+
+// registerTrustedDevice: OTP認証済みセッションで信頼デバイスを登録
+function handleRegisterTrustedDevice_(body) {
+  var claims    = verifyToken_(body.token);
+  var id        = claims.id;
+  var userAgent = String(body.user_agent || '').substring(0, 512);
+
+  var rawToken = Utilities.getUuid() + Utilities.getUuid(); // 256bit 相当
+  var hash     = trustedDeviceHash_(rawToken);
+  var now      = new Date();
+  var expires  = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30日
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('trusted_devices');
+  if (!sheet) {
+    sheet = ss.insertSheet('trusted_devices');
+    sheet.getRange(1, 1, 1, 5)
+         .setValues([['id', 'token_hash', 'expires_at', 'user_agent', 'created_at']])
+         .setFontWeight('bold').setBackground('#f0f0f0');
+  }
+  sheet.appendRow([id, hash, expires, userAgent, now]);
+  cleanExpiredTrustedDevices_(id); // 古いレコードを清掃
+
+  logAudit_(id, 'registerTrustedDevice', '-', 'ok');
+  return { trusted_token: rawToken }; // 生トークンは1回限り返却
 }
 
 // ────────────────────────────────────────────────────────────────────

@@ -123,6 +123,16 @@
       text-align:center;
     }
 
+    /* ── 信頼デバイスチェック ──────────────────────── */
+    .trust-row{margin:var(--s2) 0 var(--s4)}
+    .trust-label{
+      display:flex; align-items:center; gap:var(--s2);
+      font-size:13px; color:var(--muted); cursor:pointer; user-select:none;
+    }
+    .trust-label input[type=checkbox]{
+      width:16px; height:16px; accent-color:var(--brand); cursor:pointer; flex:none;
+    }
+
     /* ── OTP ヒント・再送 ──────────────────────────── */
     .otp-hint{font-size:13px; color:var(--muted); margin-bottom:var(--s4); line-height:1.5}
     .otp-hint strong{color:var(--ink)}
@@ -277,6 +287,12 @@
             required
             placeholder="000000"
           >
+        </div>
+        <div class="trust-row">
+          <label class="trust-label">
+            <input type="checkbox" id="trustDevice">
+            <span>このデバイスを30日間信頼する</span>
+          </label>
         </div>
         <button type="submit" class="btn-send" id="otpBtn">認証する</button>
         <div id="resend-row">
@@ -457,6 +473,15 @@ function showStep(step) {
   document.getElementById('app-area').classList.toggle('hidden',   step !== 'app');
 }
 
+// ── ログイン共通後処理 ────────────────────────────────────────────
+function onLoginSuccess(tok, lab) {
+  token     = tok;
+  userLabel = lab;
+  clearResendTimer();
+  renderApp();
+  showStep('app');
+}
+
 // ── STEP 1: ログイン（id + pw → login API） ──────────────────────
 async function handleLogin(e) {
   e.preventDefault();
@@ -468,19 +493,42 @@ async function handleLogin(e) {
   try {
     const data = await callApi('login', { id, pw });
     showSpinner(false);
-    if (data.ok) {
-      pendingId = id;
-      const hint = data.result.email_hint || '';
-      document.getElementById('otp-hint').innerHTML =
-        hint
-          ? `登録メール（<strong>${escHtml(hint)}</strong>）に6桁のコードを送信しました。`
-          : '登録メールアドレスに6桁のコードを送信しました。';
-      document.getElementById('otp-code').value = '';
-      showStep('otp');
-      startResendTimer();
-    } else {
-      showToast(data.error || 'ログインできませんでした', 'error');
+    if (!data.ok) { showToast(data.error || 'ログインできませんでした', 'error'); return; }
+
+    pendingId = id;
+
+    // otp_required=FALSE → 即ログイン成功
+    if (data.result.stage === 'token_issued') {
+      onLoginSuccess(data.result.token, data.result.label);
+      return;
     }
+
+    // otp_required=TRUE → 信頼デバイスを先にチェック
+    const savedTrustedToken = localStorage.getItem('sms_trusted_' + id);
+    if (savedTrustedToken) {
+      showSpinner(true);
+      try {
+        const td = await callApi('verifyTrustedDevice', { id, trusted_token: savedTrustedToken });
+        showSpinner(false);
+        if (td.ok) {
+          onLoginSuccess(td.result.token, td.result.label);
+          return;
+        }
+      } catch (_) { showSpinner(false); }
+      // 失敗（期限切れ等）→ 削除して OTP 画面へ
+      localStorage.removeItem('sms_trusted_' + id);
+    }
+
+    // OTP 画面へ
+    const hint = data.result.email_hint || '';
+    document.getElementById('otp-hint').innerHTML =
+      hint
+        ? `登録メール（<strong>${escHtml(hint)}</strong>）に6桁のコードを送信しました。`
+        : '登録メールアドレスに6桁のコードを送信しました。';
+    document.getElementById('otp-code').value = '';
+    document.getElementById('trustDevice').checked = false;
+    showStep('otp');
+    startResendTimer();
   } catch (err) {
     showSpinner(false);
     showToast('通信エラー: ' + err.message, 'error');
@@ -498,11 +546,23 @@ async function handleOtp(e) {
     const data = await callApi('verifyOtp', { id: pendingId, otp });
     showSpinner(false);
     if (data.ok) {
-      token     = data.result.token;
-      userLabel = data.result.label;
+      const newToken = data.result.token;
+      const newLabel = data.result.label;
+
+      // 「信頼する」チェック ON → デバイス登録（失敗しても続行）
+      if (document.getElementById('trustDevice').checked) {
+        try {
+          token = newToken; // callApi がトークンを付与できるよう一時セット
+          const td = await callApi('registerTrustedDevice', { user_agent: navigator.userAgent });
+          if (td.ok && td.result && td.result.trusted_token) {
+            localStorage.setItem('sms_trusted_' + pendingId, td.result.trusted_token);
+          }
+        } catch (_) {}
+        token = null; // onLoginSuccess で正式にセットし直す
+      }
+
       clearResendTimer();
-      renderApp();
-      showStep('app');
+      onLoginSuccess(newToken, newLabel);
     } else {
       showToast(data.error || '認証できませんでした', 'error');
     }
@@ -651,10 +711,9 @@ async function pingTest() {
 // ── GAS Web App API 呼び出し ──────────────────────────────────────
 async function callApi(action, payload) {
   const body = { action, ...payload };
-  // login/verifyOtp 以外はトークンを付与
-  if (token && action !== 'login' && action !== 'verifyOtp') {
-    body.token = token;
-  }
+  // login/verifyOtp/verifyTrustedDevice 以外はトークンを付与
+  const noTokenActions = ['login', 'verifyOtp', 'verifyTrustedDevice'];
+  if (token && !noTokenActions.includes(action)) body.token = token;
   const res = await fetch(WEBAPP_URL, {
     method:  'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
