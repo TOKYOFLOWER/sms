@@ -318,9 +318,12 @@ function getSmsAccount_(id) {
         label:         String(data[r][col['label']]),
         enabled:       String(data[r][col['enabled']]).toUpperCase().trim(),
         // 列なし・空・TRUE以外 → true（安全側に倒す）
-        otp_required:  col['otp_required'] !== undefined
-                         ? String(data[r][col['otp_required']] || '').toUpperCase().trim() !== 'FALSE'
-                         : true
+        // スプレッドシートが FALSE をブール値で返す場合も考慮
+        otp_required: (function() {
+          if (col['otp_required'] === undefined) return true;
+          var rawOtp = data[r][col['otp_required']];
+          return !(String(rawOtp).toUpperCase() === 'FALSE' || rawOtp === false);
+        })()
       };
     }
   }
