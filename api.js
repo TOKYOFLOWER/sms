@@ -16,10 +16,11 @@ function doPost(e) {
 
     var result;
     switch (action) {
-      case 'login':     result = handleLogin_(body);     break;
-      case 'verifyOtp': result = handleVerifyOtp_(body); break;
-      case 'sendSms':   result = handleSendSms_(body);   break;
-      case 'ping':      result = handlePing_(body);      break;
+      case 'login':       result = handleLogin_(body);       break;
+      case 'verifyOtp':   result = handleVerifyOtp_(body);   break;
+      case 'sendSms':     result = handleSendSms_(body);     break;
+      case 'sendSmsForm': result = handleSendSmsForm_(body); break;
+      case 'ping':        result = handlePing_(body);        break;
       default: throw new Error('unknown action: ' + action);
     }
     return json_({ ok: true, result: result });
@@ -97,66 +98,142 @@ function handleSendSms_(body) {
 
   rateLimitCheck_(id);
 
-  var smsAcc = getSmsAccount_(id);
-  if (!smsAcc) throw new Error('送信元設定がありません。管理者に連絡してください');
-  if (String(smsAcc.enabled).toUpperCase() !== 'TRUE')
-    throw new Error('送信が一時停止されています。管理者に連絡してください');
-
-  // Base64デコードで認証情報取得（ログ・レスポンスには出さない）
-  var apiKey = decodeBase64Str_(smsAcc.cpaas_api_key);
-  var secret = decodeBase64Str_(smsAcc.cpaas_secret);
-  var sender = smsAcc.cpaas_sender;
-  var label  = smsAcc.label;
-
-  var to   = normalizePhone_(body.to);
-  var text = String(body.text || '').trim();
-  if (!text) throw new Error('本文が空です');
-  if (text.length > SMS_RULES.MAX)
-    throw new Error('本文が長すぎます（上限 ' + SMS_RULES.MAX + '文字）');
-
-  var segments = Math.ceil(text.length / SMS_RULES.SEGMENT);
-
-  // CPaaS 認証トークン取得
-  var authRes = UrlFetchApp.fetch('https://api.cpaas.symphony.rakuten.net/auth/v1/token', {
-    method: 'get',
-    headers: {
-      'Authorization': 'Basic ' + Utilities.base64Encode(apiKey + ':' + secret),
-      'Accept': 'application/json'
-    },
-    muteHttpExceptions: true
+  var result = sendSingleSMSFromForm({
+    accountId:   id,
+    phoneNumber: body.to,
+    message:     body.text,
+    countryCode: '81'
   });
-  if (authRes.getResponseCode() !== 200)
-    throw new Error('CPaaS 認証エラー: ' + authRes.getResponseCode());
-  var jwtToken = JSON.parse(authRes.getContentText()).jwt_token;
+  if (!result.success) throw new Error(result.message);
+  return { segments: result.how_many_message_parts, message: result.result_message };
+}
 
-  // SMS 送信
-  var smsRes = UrlFetchApp.fetch('https://api.cpaas.symphony.rakuten.net/sms/v1/submit', {
-    method: 'post',
-    headers: {
-      'Authorization': 'Bearer ' + jwtToken,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json; charset=UTF-8'
-    },
-    payload: JSON.stringify({
-      from: sender, to: to,
+// token 検証 + 会員確認 → sendSingleSMSFromForm へ委譲（doPost action:'sendSmsForm'）
+function handleSendSmsForm_(body) {
+  var claims = verifyToken_(body.token);
+  var id     = claims.id;
+  var member = getMember_(id);
+  if (!member || !isEntitled_(member))
+    throw new Error('ご契約が有効でないか、送信権限がありません');
+  rateLimitCheck_(id);
+  var result = sendSingleSMSFromForm({
+    accountId:   id,
+    phoneNumber: body.to,
+    message:     body.text,
+    countryCode: String(body.countryCode || '81')
+  });
+  if (!result.success) throw new Error(result.message);
+  return result;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// sendSingleSMSFromForm: CPaaS 送信ロジック本体
+//   doPost(handleSendSms_ / handleSendSmsForm_) および
+//   将来の google.script.run 両方から呼べるよう token を持たない設計
+// ────────────────────────────────────────────────────────────────────
+function sendSingleSMSFromForm(data) {
+  var sender       = null;
+  var normalizedTo = null;
+  try {
+    var smsAcc = getSmsAccount_(data.accountId);
+    if (!smsAcc) throw new Error('送信元設定がありません。管理者に連絡してください');
+    if (String(smsAcc.enabled).toUpperCase() !== 'TRUE')
+      throw new Error('送信が一時停止されています。管理者に連絡してください');
+
+    // from: スプレッドシートが数値化しても先頭0を守るため必ず String
+    sender = String(smsAcc.cpaas_sender || '').trim();
+    if (sender.length > 0 && sender.length <= 9)
+      Logger.log('[WARN] sender が9桁以下 — 先頭0が欠落している可能性: "' + sender + '"');
+
+    normalizedTo = normalizePhoneNumber_(data.phoneNumber, data.countryCode || '81');
+
+    var text = String(data.message || '').trim();
+    if (!text) throw new Error('本文が空です');
+    if (text.length > SMS_RULES.MAX)
+      throw new Error('本文が長すぎます（上限 ' + SMS_RULES.MAX + '文字）');
+
+    // 認証情報取得（ログ・レスポンスには出さない）
+    var apiKey   = decodeBase64Str_(smsAcc.cpaas_api_key);
+    var secret   = decodeBase64Str_(smsAcc.cpaas_secret);
+    var segments = Math.ceil(text.length / SMS_RULES.SEGMENT);
+
+    // CPaaS 認証トークン取得
+    var authRes = UrlFetchApp.fetch('https://api.cpaas.symphony.rakuten.net/auth/v1/token', {
+      method: 'get',
+      headers: {
+        'Authorization': 'Basic ' + Utilities.base64Encode(apiKey + ':' + secret),
+        'Accept': 'application/json'
+      },
+      muteHttpExceptions: true
+    });
+    if (authRes.getResponseCode() !== 200)
+      throw new Error('CPaaS 認証エラー: ' + authRes.getResponseCode());
+    var jwtToken = JSON.parse(authRes.getContentText()).jwt_token;
+
+    // 送信前ログ（secret / JWT は出さない）
+    var payload = {
+      from: sender, to: normalizedTo,
       message_type: 'unicode',
       unicode_message: { text: text }
-    }),
-    muteHttpExceptions: true
-  });
+    };
+    Logger.log('SMS送信開始');
+    Logger.log('accountId: '      + data.accountId);
+    Logger.log('from: '           + sender);
+    Logger.log('to: '             + normalizedTo);
+    Logger.log('message length: ' + text.length);
+    Logger.log('payload: '        + JSON.stringify(payload));
 
-  var smsJson = JSON.parse(smsRes.getContentText());
-  if (smsRes.getResponseCode() !== 200)
-    throw new Error('SMS送信失敗: ' + (smsJson.result_message || smsRes.getResponseCode()));
+    // SMS 送信
+    var smsRes = UrlFetchApp.fetch('https://api.cpaas.symphony.rakuten.net/sms/v1/submit', {
+      method: 'post',
+      headers: {
+        'Authorization': 'Bearer ' + jwtToken,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json; charset=UTF-8'
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    var statusCode   = smsRes.getResponseCode();
+    var responseText = smsRes.getContentText();
+    Logger.log('Rakuten CPaaS statusCode: ' + statusCode);
+    Logger.log('Rakuten CPaaS response: '   + responseText);
 
-  writeToLogSheet([
-    new Date(), id, to, text,
-    '送信成功', smsJson.result_message,
-    text.length + ' / 660 (' + segments + ' SMS)'
-  ]);
-  logAudit_(id, 'sendSms', to, 'ok: ' + label);
+    var smsJson = JSON.parse(responseText);
+    // HTTP 200 かつ result_code === 0 のみ成功
+    if (statusCode !== 200 || Number(smsJson.result_code) !== 0)
+      throw new Error('SMS送信失敗: ' + (smsJson.result_message || statusCode));
 
-  return { segments: segments, message: smsJson.result_message };
+    appendSmsLog_({
+      '送信日時': new Date(), '会員ID': data.accountId,
+      'from': sender, 'to': normalizedTo, 'メッセージ内容': text,
+      'ステータス': '送信成功', 'result_code': smsJson.result_code,
+      'result_message': smsJson.result_message, 'message_id': smsJson.message_id,
+      'how_many_message_parts': smsJson.how_many_message_parts,
+      '文字数情報': text.length + ' / 660 (' + segments + ' SMS)'
+    });
+    logAudit_(data.accountId, 'sendSms', normalizedTo, 'ok: ' + smsAcc.label);
+
+    return {
+      success: true, message: '送信しました',
+      result_code: smsJson.result_code, result_message: smsJson.result_message,
+      message_id: smsJson.message_id,
+      how_many_message_parts: smsJson.how_many_message_parts,
+      to: normalizedTo, from: sender
+    };
+
+  } catch (e) {
+    appendSmsLog_({
+      '送信日時': new Date(), '会員ID': String(data.accountId || ''),
+      'from': sender || '', 'to': normalizedTo || String(data.phoneNumber || ''),
+      'メッセージ内容': String(data.message || ''),
+      'ステータス': 'エラー', 'result_message': e.message
+    });
+    logAudit_(String(data.accountId || '-'), 'sendSms',
+              normalizedTo || String(data.phoneNumber || '-'), 'error: ' + e.message);
+    return { success: false, message: e.message,
+             to: normalizedTo, from: sender };
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -429,12 +506,13 @@ function isEntitled_(member) {
   return kaihiActive || grandfathered;
 }
 
-function normalizePhone_(raw) {
-  if (!raw) throw new Error('宛先電話番号が空です');
-  var digits = String(raw).replace(/\D/g, '');
-  if (digits.length < 7 || digits.length > 15)
-    throw new Error('電話番号の桁数が不正です（' + digits.length + '桁）');
-  return digits;
+function normalizePhoneNumber_(raw, countryCode) {
+  var phone = String(raw || '').replace(/[^\d]/g, '');
+  if (!phone) throw new Error('宛先電話番号が空です');
+  var code = String(countryCode || '81').replace(/[^\d]/g, '');
+  if (phone.indexOf(code) === 0) return phone;          // 81... はそのまま
+  if (phone.charAt(0) === '0') return code + phone.substring(1); // 070... → 8170...
+  return code + phone;                                  // 70... → 8170...
 }
 
 function rateLimitCheck_(id) {
@@ -468,4 +546,42 @@ function logAudit_(id, action, to, status) {
 function json_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 列追記対応ログ書き込み（既存列はそのまま・不足列を右端に追加）
+// ────────────────────────────────────────────────────────────────────
+function appendSmsLog_(logObj) {
+  try {
+    var ss    = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('log');
+    var HEADERS = ['送信日時', '会員ID', 'from', 'to', 'メッセージ内容',
+                   'ステータス', 'result_code', 'result_message',
+                   'message_id', 'how_many_message_parts', '文字数情報'];
+    if (!sheet) {
+      sheet = ss.insertSheet('log');
+      sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS])
+           .setFontWeight('bold').setBackground('#f0f0f0');
+    }
+    // 既存ヘッダーを読み、不足列を右端に追加
+    var lastCol = sheet.getLastColumn() || 1;
+    var hdrRow  = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    var hdrMap  = {};
+    hdrRow.forEach(function(h, i) { hdrMap[String(h).trim()] = i; });
+    HEADERS.forEach(function(h) {
+      if (hdrMap[h] === undefined) {
+        var c = sheet.getLastColumn() + 1;
+        sheet.getRange(1, c).setValue(h).setFontWeight('bold').setBackground('#f0f0f0');
+        hdrMap[h] = c - 1;
+      }
+    });
+    // 列マッピングでデータ行を組み立て
+    var row = new Array(sheet.getLastColumn()).fill('');
+    Object.keys(logObj).forEach(function(k) {
+      if (hdrMap[k] !== undefined) row[hdrMap[k]] = logObj[k];
+    });
+    sheet.appendRow(row);
+  } catch (err) {
+    Logger.log('log write error: ' + err.message);
+  }
 }
