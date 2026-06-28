@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#0C6B43" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0B120E" media="(prefers-color-scheme: dark)">
   <title>SMS送信侍</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📲</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Space+Grotesk:wght@500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -227,6 +228,20 @@
     @media (prefers-reduced-motion:reduce){
       *{animation-duration:.001ms !important; transition-duration:.001ms !important}
     }
+
+    /* ── 送信履歴 ───────────────────────────────────── */
+    .history-item{padding:var(--s3) 0; border-bottom:1px solid var(--border)}
+    .history-item:last-child{border-bottom:none}
+    .history-meta{display:flex; align-items:center; gap:var(--s2); flex-wrap:wrap; margin-bottom:4px}
+    .history-date{font-family:var(--font-mono); font-size:11px; color:var(--muted)}
+    .history-to{font-family:var(--font-mono); font-size:12px; color:var(--ink); font-weight:500}
+    .history-status{
+      font-size:11px; font-weight:500; border-radius:var(--r-chip);
+      padding:2px 8px; margin-left:auto; white-space:nowrap;
+    }
+    .history-status.ok{background:var(--brand-tint); color:var(--brand-strong)}
+    .history-status.err{background:var(--danger-tint); color:var(--danger)}
+    .history-msg{font-size:13px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   </style>
 </head>
 <body>
@@ -369,6 +384,16 @@
         </form>
 
         <span id="ping-link">疎通確認 (ping)</span>
+      </div>
+    </div>
+
+    <div id="history-section" class="hidden" style="margin-top:var(--s4)">
+      <div class="card">
+        <div class="eyebrow" style="margin-bottom:var(--s4)">送信履歴 · HISTORY</div>
+        <div id="history-loading" class="center-msg hidden">読み込み中...</div>
+        <div id="history-error" class="hidden" style="color:var(--danger);font-size:14px;padding:var(--s2) 0"></div>
+        <div id="history-empty" class="center-msg hidden">まだ送信履歴はありません</div>
+        <div id="history-list"></div>
       </div>
     </div>
 
@@ -621,6 +646,7 @@ function renderApp() {
   document.getElementById('no-permission-area').classList.add('hidden');
   document.getElementById('form-section').classList.remove('hidden');
   document.getElementById('account-label').textContent = userLabel || '';
+  loadHistory();
 }
 
 function signOut() {
@@ -629,7 +655,58 @@ function signOut() {
   userLabel = null;
   document.getElementById('login-id').value = '';
   document.getElementById('login-pw').value = '';
+  document.getElementById('history-section').classList.add('hidden');
   showStep('login');
+}
+
+// ── 送信履歴取得・表示 ────────────────────────────────────────────
+async function loadHistory() {
+  const section = document.getElementById('history-section');
+  const loading = document.getElementById('history-loading');
+  const error   = document.getElementById('history-error');
+  const empty   = document.getElementById('history-empty');
+  const list    = document.getElementById('history-list');
+
+  section.classList.remove('hidden');
+  loading.classList.remove('hidden');
+  error.classList.add('hidden');
+  empty.classList.add('hidden');
+  list.innerHTML = '';
+
+  try {
+    const data = await callApi('listHistory', {});
+    loading.classList.add('hidden');
+    if (!data.ok) {
+      error.textContent = 'エラー: ' + (data.error || '履歴を取得できませんでした');
+      error.classList.remove('hidden');
+      return;
+    }
+    const history = (data.result && data.result.history) || [];
+    if (history.length === 0) {
+      empty.classList.remove('hidden');
+      return;
+    }
+    list.innerHTML = history.map(h => {
+      const dt  = h.dt ? new Date(h.dt).toLocaleString('ja-JP', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit'
+      }) : '';
+      const preview = h.msg && h.msg.length > 80 ? h.msg.substring(0, 80) + '…' : (h.msg || '');
+      const stClass = (h.st || '').includes('成功') ? 'ok' : 'err';
+      return `<div class="history-item">
+        <div class="history-meta">
+          <span class="history-date">${escHtml(dt)}</span>
+          <span class="history-to">${escHtml(h.to || '')}</span>
+          <span class="history-status ${stClass}">${escHtml(h.st || '')}</span>
+        </div>
+        <div class="history-msg">${escHtml(preview)}</div>
+      </div>`;
+    }).join('');
+  } catch (err) {
+    loading.classList.add('hidden');
+    error.textContent = '通信エラー: ' + err.message;
+    error.classList.remove('hidden');
+  }
 }
 
 // ── 文字数カウント ────────────────────────────────────────────────

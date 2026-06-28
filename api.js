@@ -8,6 +8,12 @@ var SMS_RULES = { SEGMENT: 70, MAX: 660 };
 // 未知の値を誤って有効にしないよう明示一致のみ有効
 var KAIHI_ACTIVE_VALUES = ['active'];
 
+// log シートの列定義（唯一の真実）。シートの列順と一致させること。
+var LOG_HEADERS = [
+  '送信日時', '会員ID', 'from', 'to', 'メッセージ内容', 'ステータス',
+  'result_code', 'result_message', 'message_id', 'how_many_messages', '文字数情報'
+];
+
 function doPost(e) {
   var action = '-';
   try {
@@ -22,6 +28,7 @@ function doPost(e) {
       case 'registerTrustedDevice':result = handleRegisterTrustedDevice_(body);break;
       case 'sendSms':              result = handleSendSms_(body);              break;
       case 'sendSmsForm':          result = handleSendSmsForm_(body);          break;
+      case 'listHistory':          result = handleListHistory_(body);          break;
       case 'ping':                 result = handlePing_(body);                 break;
       default: throw new Error('unknown action: ' + action);
     }
@@ -220,7 +227,7 @@ function sendSingleSMSFromForm(data) {
       'from': sender, 'to': normalizedTo, 'メッセージ内容': text,
       'ステータス': '送信成功', 'result_code': smsJson.result_code,
       'result_message': smsJson.result_message, 'message_id': smsJson.message_id,
-      'how_many_message_parts': smsJson.how_many_message_parts,
+      'how_many_messages': smsJson.how_many_message_parts,
       '文字数情報': text.length + ' / 660 (' + segments + ' SMS)'
     });
     logAudit_(data.accountId, 'sendSms', normalizedTo, 'ok: ' + smsAcc.label);
@@ -662,60 +669,90 @@ function json_(obj) {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 列追記対応ログ書き込み
-//   既存シートのヘッダー行を読み取り、列名の揺れをエイリアスで吸収して
-//   正しい列位置に書き込む。同名列は最初の出現位置を優先。
-//   from/result_* 等の拡張列は H列（index 7）以降に配置。
+// log 書き込み（ヘッダー整列・自己修復・排他ロック付き）
+//   logObj は { ヘッダー名: 値 } のオブジェクト。LOG_HEADERS を唯一の真実とし、
+//   シートヘッダーが欠損・不一致なら自動修復してから書き込む。
 // ────────────────────────────────────────────────────────────────────
 function appendSmsLog_(logObj) {
   try {
     var ss    = SpreadsheetApp.getActiveSpreadsheet();
     var sheet = ss.getSheetByName('log');
+    if (!sheet) sheet = ss.insertSheet('log');
 
-    // シートがない場合のみ新規作成
-    if (!sheet) {
-      sheet = ss.insertSheet('log');
-      sheet.getRange(1, 1, 1, 12).setValues([[
-        '日時','会員ID','宛先','メッセージ','ステータス','文字数情報','',
-        'from','result_code','result_message','message_id','how_many_message_parts'
-      ]]).setFontWeight('bold').setBackground('#f0f0f0');
-    }
-
-    // logObj キー → 実シートのヘッダー名（列名の揺れを吸収）
-    var KEY_ALIAS = {
-      '送信日時':      '日時',   // A列
-      'to':            '宛先',   // C列
-      'メッセージ内容': 'メッセージ' // D列
-    };
-    // H列以降に配置する拡張列（既存になければ追加）
-    var EXTENDED_COLS = ['from','result_code','result_message','message_id','how_many_message_parts'];
-
-    // ヘッダー行読み取り（同名列は最初の出現位置を優先して重複を無視）
-    var lastCol = Math.max(sheet.getLastColumn(), 1);
-    var hdrRow  = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
-    var hdrMap  = {};
-    hdrRow.forEach(function(h, i) {
-      var name = String(h).trim();
-      if (name && hdrMap[name] === undefined) hdrMap[name] = i;
-    });
-
-    // 拡張列が未登録なら H列（index 7 = 8列目）以降に追加
-    EXTENDED_COLS.forEach(function(col) {
-      if (hdrMap[col] === undefined) {
-        var c = Math.max(sheet.getLastColumn() + 1, 8);
-        sheet.getRange(1, c).setValue(col).setFontWeight('bold').setBackground('#f0f0f0');
-        hdrMap[col] = c - 1;
+    var lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      // ヘッダー行を正規化して照合
+      var norm = function(h) { return String(h).normalize('NFKC').trim(); };
+      var needsRepair = true;
+      if (sheet.getLastRow() >= 1 && sheet.getLastColumn() >= LOG_HEADERS.length) {
+        var existing = sheet.getRange(1, 1, 1, LOG_HEADERS.length).getValues()[0];
+        needsRepair = !LOG_HEADERS.every(function(h, i) { return norm(existing[i]) === norm(h); });
       }
-    });
+      if (needsRepair) {
+        sheet.getRange(1, 1, 1, LOG_HEADERS.length)
+             .setValues([LOG_HEADERS])
+             .setFontWeight('bold').setBackground('#f0f0f0');
+      }
 
-    // エイリアス解決後にデータ行を組み立て
-    var row = new Array(sheet.getLastColumn()).fill('');
-    Object.keys(logObj).forEach(function(key) {
-      var colName = KEY_ALIAS[key] !== undefined ? KEY_ALIAS[key] : key;
-      if (hdrMap[colName] !== undefined) row[hdrMap[colName]] = logObj[key];
-    });
-    sheet.appendRow(row);
+      // LOG_HEADERS 順に値を並べる（対応なしは空文字）
+      var row = LOG_HEADERS.map(function(h) {
+        var v = logObj[h];
+        return (v === undefined || v === null) ? '' : v;
+      });
+      sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+    } finally {
+      lock.releaseLock();
+    }
   } catch (err) {
     Logger.log('log write error: ' + err.message);
   }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// listHistory: トークン検証 → 自分の送信履歴を返す（最新50件）
+//   会員IDはトークンから取得。クライアント指定は受け付けない。
+//   返却列: 送信日時 / to / メッセージ内容 / ステータス のみ。
+// ────────────────────────────────────────────────────────────────────
+function handleListHistory_(body) {
+  var claims = verifyToken_(body.token);
+  var id     = claims.id;
+
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('log');
+  if (!sheet || sheet.getLastRow() < 2) return { history: [] };
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0];
+
+  var colMap = {};
+  hdr.forEach(function(h, i) {
+    colMap[String(h).normalize('NFKC').trim()] = i;
+  });
+
+  var idCol  = colMap['会員ID'];
+  if (idCol === undefined) return { history: [] };
+
+  var dtCol  = colMap['送信日時'];
+  var toCol  = colMap['to'];
+  var msgCol = colMap['メッセージ内容'];
+  var stCol  = colMap['ステータス'];
+
+  var normalizedId = String(id).normalize('NFKC').trim();
+  var rows = [];
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][idCol] || '').normalize('NFKC').trim() !== normalizedId) continue;
+    var dt   = dtCol  !== undefined ? data[r][dtCol]  : '';
+    var dtStr = dt instanceof Date ? dt.toISOString() : String(dt || '');
+    rows.push({
+      dt:  dtStr,
+      to:  toCol  !== undefined ? String(data[r][toCol]  || '') : '',
+      msg: msgCol !== undefined ? String(data[r][msgCol] || '') : '',
+      st:  stCol  !== undefined ? String(data[r][stCol]  || '') : ''
+    });
+  }
+
+  rows.sort(function(a, b) { return b.dt > a.dt ? 1 : -1; });
+  return { history: rows.slice(0, 50) };
 }
