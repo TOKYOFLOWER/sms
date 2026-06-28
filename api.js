@@ -659,36 +659,57 @@ function json_(obj) {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 列追記対応ログ書き込み（既存列はそのまま・不足列を右端に追加）
+// 列追記対応ログ書き込み
+//   既存シートのヘッダー行を読み取り、列名の揺れをエイリアスで吸収して
+//   正しい列位置に書き込む。同名列は最初の出現位置を優先。
+//   from/result_* 等の拡張列は H列（index 7）以降に配置。
 // ────────────────────────────────────────────────────────────────────
 function appendSmsLog_(logObj) {
   try {
     var ss    = SpreadsheetApp.getActiveSpreadsheet();
     var sheet = ss.getSheetByName('log');
-    var HEADERS = ['送信日時', '会員ID', 'from', 'to', 'メッセージ内容',
-                   'ステータス', 'result_code', 'result_message',
-                   'message_id', 'how_many_message_parts', '文字数情報'];
+
+    // シートがない場合のみ新規作成
     if (!sheet) {
       sheet = ss.insertSheet('log');
-      sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS])
-           .setFontWeight('bold').setBackground('#f0f0f0');
+      sheet.getRange(1, 1, 1, 12).setValues([[
+        '日時','会員ID','宛先','メッセージ','ステータス','文字数情報','',
+        'from','result_code','result_message','message_id','how_many_message_parts'
+      ]]).setFontWeight('bold').setBackground('#f0f0f0');
     }
-    // 既存ヘッダーを読み、不足列を右端に追加
-    var lastCol = sheet.getLastColumn() || 1;
+
+    // logObj キー → 実シートのヘッダー名（列名の揺れを吸収）
+    var KEY_ALIAS = {
+      '送信日時':      '日時',   // A列
+      'to':            '宛先',   // C列
+      'メッセージ内容': 'メッセージ' // D列
+    };
+    // H列以降に配置する拡張列（既存になければ追加）
+    var EXTENDED_COLS = ['from','result_code','result_message','message_id','how_many_message_parts'];
+
+    // ヘッダー行読み取り（同名列は最初の出現位置を優先して重複を無視）
+    var lastCol = Math.max(sheet.getLastColumn(), 1);
     var hdrRow  = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
     var hdrMap  = {};
-    hdrRow.forEach(function(h, i) { hdrMap[String(h).trim()] = i; });
-    HEADERS.forEach(function(h) {
-      if (hdrMap[h] === undefined) {
-        var c = sheet.getLastColumn() + 1;
-        sheet.getRange(1, c).setValue(h).setFontWeight('bold').setBackground('#f0f0f0');
-        hdrMap[h] = c - 1;
+    hdrRow.forEach(function(h, i) {
+      var name = String(h).trim();
+      if (name && hdrMap[name] === undefined) hdrMap[name] = i;
+    });
+
+    // 拡張列が未登録なら H列（index 7 = 8列目）以降に追加
+    EXTENDED_COLS.forEach(function(col) {
+      if (hdrMap[col] === undefined) {
+        var c = Math.max(sheet.getLastColumn() + 1, 8);
+        sheet.getRange(1, c).setValue(col).setFontWeight('bold').setBackground('#f0f0f0');
+        hdrMap[col] = c - 1;
       }
     });
-    // 列マッピングでデータ行を組み立て
+
+    // エイリアス解決後にデータ行を組み立て
     var row = new Array(sheet.getLastColumn()).fill('');
-    Object.keys(logObj).forEach(function(k) {
-      if (hdrMap[k] !== undefined) row[hdrMap[k]] = logObj[k];
+    Object.keys(logObj).forEach(function(key) {
+      var colName = KEY_ALIAS[key] !== undefined ? KEY_ALIAS[key] : key;
+      if (hdrMap[colName] !== undefined) row[hdrMap[colName]] = logObj[key];
     });
     sheet.appendRow(row);
   } catch (err) {
