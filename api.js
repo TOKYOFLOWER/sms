@@ -223,8 +223,10 @@ function sendSingleSMSFromForm(data) {
       throw new Error('SMS送信失敗: ' + (smsJson.result_message || statusCode));
 
     appendSmsLog_({
-      '送信日時': new Date(), '会員ID': data.accountId,
-      'from': sender, 'to': normalizedTo, 'メッセージ内容': text,
+      '送信日時': Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+      '会員ID': data.accountId,
+      'from': String(sender || '').replace(/^\+81/, '0'),
+      'to': normalizedTo, 'メッセージ内容': text,
       'ステータス': '送信成功', 'result_code': smsJson.result_code,
       'result_message': smsJson.result_message, 'message_id': smsJson.message_id,
       'how_many_messages': smsJson.how_many_message_parts,
@@ -242,8 +244,10 @@ function sendSingleSMSFromForm(data) {
 
   } catch (e) {
     appendSmsLog_({
-      '送信日時': new Date(), '会員ID': String(data.accountId || ''),
-      'from': sender || '', 'to': normalizedTo || String(data.phoneNumber || ''),
+      '送信日時': Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss'),
+      '会員ID': String(data.accountId || ''),
+      'from': String(sender || '').replace(/^\+81/, '0'),
+      'to': normalizedTo || String(data.phoneNumber || ''),
       'メッセージ内容': String(data.message || ''),
       'ステータス': 'エラー', 'result_message': e.message
     });
