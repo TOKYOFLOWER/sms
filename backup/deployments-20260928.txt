@@ -1,0 +1,9 @@
+Found 8 deployments.
+- AKfycbxuyFZsAJnr1TASVWB9_egXRgFsBvT2onFri-F9zkw @HEAD 
+- AKfycbwqASuXWpepLutbGY9gjtei7KijCIcj60LX-4hO4EN3sjBnvyw1_ED3AxkrwQzHPKRS @57 - [修正版] 東京フラワー
+- AKfycbxdIjfCKxkD63SvWN-XxT9021DsCocqz0lKcG2G0ZGD2qWs7JgeVDXL4qtw2W5Na0ty @53 - [修正版] エデュテ
+- AKfycbxpi3noX1pdDRsx_OvcYaXLs64DwXHj2LON8mHjUDfWaVZnHHDMxGXPtAxNyfLzHbRi @3 - フォーム03
+- AKfycbxRCrEUgkVl0vPPB-SIbQJXcezxswj81xi1d9ak0OPE9CYHuIUs1l0IpYIZycjYXjd3 @75 - fix: entitlement no longer depends on expiry
+- AKfycby0wfEiq-CqAxNl42jWVw_SGu3xE-ZBsC4cmZElv2Dw2kVVupIf-2RfXxhgK-Y8GiSU @59 - Phase 2-4: login-based account assignment
+- AKfycbzVzSFQ6Ha4cwocYrRPXKSelnmRjV1R55z5BMGRvb1RfIXX9gX2RuDz4qrOsRtV0agi @11 - index.html
+- AKfycbzLT2aWpZVmP5ANqIOwvXGwFdldzihW2nctly-Aq6p_LWeqOcYIhjV7_c5KQt34nq8u @54 - [修正版] 中野製本
