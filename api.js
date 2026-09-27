@@ -55,7 +55,7 @@ function handleLogin_(body) {
   var pwNonEmpty = storedPw.length > 0;
   var pwOk       = pwNonEmpty && safeEqual_(storedPw, pw);
 
-  // entitled = license_valid && (kaihiActive || grandfathered)
+  // entitled = kaihiActive || grandfathered（expiry は SMS では参照しない）
   // flag・payment_status(GMO廃止残骸)は判定に使わない
   var isValid = member && pwOk && member.email && isEntitled_(member);
 
@@ -108,7 +108,7 @@ function handleSendSms_(body) {
   var claims = verifyToken_(body.token);
   var id     = claims.id;
 
-  // 会員有効性を都度再チェック（entitled = license_valid && (kaihiActive || grandfathered)）
+  // 会員有効性を都度再チェック（entitled = kaihiActive || grandfathered）
   var member = getMember_(id);
   if (!member || !isEntitled_(member)) {
     throw new Error('ご契約が有効でないか、送信権限がありません');
@@ -608,23 +608,18 @@ function decodeBase64Str_(b64) {
   } catch (_) { return ''; }
 }
 
-function isValidExpiry_(expiry) {
-  if (!expiry) return false;
-  var d = expiry instanceof Date ? expiry : new Date(expiry);
-  return !isNaN(d.getTime()) && d > new Date();
-}
-
 // kaihipay_status のホワイトリスト判定（未知の値を誤って有効にしないよう明示一致）
 function isKaihiActive_(status) {
   var s = String(status || '').trim().toLowerCase();
   return KAIHI_ACTIVE_VALUES.indexOf(s) !== -1;
 }
 
-// 利用権判定: entitled = license_valid && (kaihiActive || grandfathered)
+// 利用権判定（SMS送信侍）: entitled = kaihiActive || grandfathered
+// expiry（楽天ライセンス期限）は楽天系ツール専用の概念のため SMS では参照しない
+// （GSD方針: SMS専業会員は expiry 空欄。2026-09 に tokyoflower が期限切れ→空欄化でログイン不可になった対策）
 // flag（実行中フラグ）・payment_status（GMO廃止残骸）は参照しない
 function isEntitled_(member) {
   if (!member) return false;
-  if (!isValidExpiry_(member.expiry)) return false;
   var kaihiActive   = isKaihiActive_(member.kaihipay_status);
   var grandfathered = String(member.role || '').trim() === 'grandfathered';
   return kaihiActive || grandfathered;

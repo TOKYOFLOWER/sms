@@ -2,3 +2,6 @@
 .clasprc.json
 node_modules/
 *.log
+_gas_live/
+_pages_live.html
+deployments_*.txt
