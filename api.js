@@ -85,7 +85,7 @@ var SCHEMA = [
     sheetProp: 'SMS_SHEET_ID', tab: 'queue',
     headers: [
       'queue_id', 'tenant_id', '会員ID', 'from', 'to', 'body', 'scheduled_at',
-      'status', 'result', 'sent_at', 'batch_id'
+      'status', 'result', 'sent_at', 'batch_id', 'retry_count'
     ],
     phoneColumns: ['from', 'to']
   },
@@ -121,6 +121,7 @@ function doPost(e) {
       case 'registerTrustedDevice':result = handleRegisterTrustedDevice_(body);break;
       case 'sendSms':              result = handleSendSms_(body);              break;
       case 'sendSmsForm':          result = handleSendSmsForm_(body);          break;
+      case 'bulkSend':              result = handleBulkSend_(body);             break;
       case 'listHistory':          result = handleListHistory_(body);          break;
       case 'ping':                 result = handlePing_(body);                 break;
 
@@ -248,6 +249,173 @@ function handleSendSmsForm_(body) {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// STEP4a: 一斉送信の投入API（バックエンド／キュー処理）
+//   bulkSend: token検証 → queueタブへrecipientsを1行ずつ投入する。
+//   実際の送信は processQueue_（トリガーから定期実行）が行う。
+//   ※ bulkSendは国内一斉送信専用機能として設計しているため、電話番号正規化は
+//     常に countryCode='81' 固定とする（GSDの複数国番号運用は既存の単発送信
+//     (handleSendSms_/handleSendSmsForm_)のみ引き続きサポートし、この一斉送信
+//     経路には影響しない）。国番号ガード(addendum B)自体は sendSingleSMSFromForm
+//     に実装し、単発・queue経由の両方の実送信タイミングで一元的に効かせている。
+// ────────────────────────────────────────────────────────────────────
+function handleBulkSend_(body) {
+  var claims = verifyToken_(body.token);
+  var id     = claims.id;
+  var member = getMember_(id);
+  if (!member || !isEntitled_(member)) {
+    throw new Error('ご契約が有効でないか、送信権限がありません');
+  }
+
+  var recipients = Array.isArray(body.recipients) ? body.recipients : [];
+  if (!recipients.length) throw new Error('recipients が空です');
+
+  var bodyTemplate = String(body.bodyTemplate || '');
+  if (!bodyTemplate.trim()) throw new Error('bodyTemplate が空です');
+
+  var memberTenantId = member.tenant_id || 'GSD';
+
+  // tenant管理(tenantsタブ)に未登録の会員は、既存GSD運用への影響回避を最優先し、
+  // 無制限のGSD同様の挙動（daily_limit対象外・trial判定なし）にする。
+  var tenant = getTenantById_(memberTenantId) || { tenant_id: 'GSD', plan: 'standard', status: 'active' };
+
+  // 送信可否の事前チェック（拒否なら例外→doPostがok:falseで返す）
+  checkSendAllowed_(tenant, recipients.length);
+
+  var scheduledAt = new Date();
+  if (body.scheduledAt) {
+    if (!checkScheduledSendAllowed_(tenant)) {
+      throw new Error('このプランでは予約送信はご利用いただけません');
+    }
+    var parsed = new Date(body.scheduledAt);
+    if (isNaN(parsed.getTime())) throw new Error('scheduledAt の形式が不正です');
+    scheduledAt = parsed;
+  }
+
+  var smsAcc     = getSmsAccount_(id);
+  var senderFrom = smsAcc ? normalizePhoneFrom_(smsAcc.cpaas_sender) : '';
+
+  var batchId = Utilities.getUuid();
+  var rows    = [];
+  var errors  = [];
+
+  // 差し込み記法{{key}}の置換 → 文字数チェック → 電話番号正規化。
+  // 判断: 1件のエラー（文字数超過・電話番号不正等）で全体を拒否せず、
+  //   そのrecipientだけエラーとして記録し、他の正常なrecipientの投入は継続する
+  //   （CSVアップロード運用を想定すると、1行の不備で全件やり直しになるのは
+  //   ユーザー体験上望ましくないため）。
+  recipients.forEach(function(r, idx) {
+    try {
+      var text = renderTemplate_(bodyTemplate, r);
+      calcSegments_(text); // MAX超過ならここで例外
+      var normalizedTo = normalizePhoneNumber_(r && r.to, '81');
+      rows.push([
+        Utilities.getUuid(), memberTenantId, id, senderFrom, normalizedTo, text,
+        scheduledAt, 'pending', '', '', batchId, 0
+      ]);
+    } catch (e) {
+      errors.push({ index: idx, to: (r && r.to) || '', error: e.message });
+    }
+  });
+
+  if (rows.length) {
+    var sheet = getQueueSheet_();
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  logAudit_(id, 'bulkSend', '-',
+            'queued:' + rows.length + ' errors:' + errors.length + ' batch:' + batchId);
+
+  return { batch_id: batchId, queued: rows.length, errors: errors };
+}
+
+// {{key}} 差し込み記法の置換（未定義キーは空文字）
+function renderTemplate_(template, vars) {
+  return String(template || '').replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, function(_, key) {
+    return (vars && vars[key] !== undefined && vars[key] !== null) ? String(vars[key]) : '';
+  });
+}
+
+// queue タブのSheetオブジェクトを取得する（無ければ例外。ensureSchema_で作成済み前提）
+function getQueueSheet_() {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('queue');
+  if (!sheet) throw new Error('queue タブが存在しません（ensureSchema_を実行してください）');
+  return sheet;
+}
+
+// tenants タブから該当tenant_idの1行をオブジェクトで返す（無ければnull）
+function getTenantById_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet || sheet.getLastRow() < 2) return null;
+
+  var data  = sheet.getDataRange().getValues();
+  var hdr   = data[0].map(function(h) { return String(h).trim(); });
+  var idCol = hdr.indexOf('tenant_id');
+  if (idCol === -1) return null;
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][idCol]).trim() !== String(tenantId).trim()) continue;
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+    return obj;
+  }
+  return null;
+}
+
+// usage タブへの計上（tenant_id・当月の行が無ければ新規作成）。
+//   isFree=true なら free_used のみ+1。isFree=false なら billable_count と
+//   sent_count の両方を +segments（addendum C: 分割数分を課金単位として計上）。
+//   ※ processQueue_ がスクリプトロック保持中に呼ぶ前提のため、ここでは
+//     二重ロックによるデッドロックを避けるため独自のロックは取得しない。
+function incrementUsage_(tenantId, isFree, segments) {
+  segments = Number(segments) > 0 ? Number(segments) : 1;
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('usage');
+  if (!sheet) return;
+
+  var ym      = currentYearMonth_();
+  var lastRow = sheet.getLastRow();
+  var hdr     = lastRow >= 1
+    ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) { return String(h).trim(); })
+    : [];
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['年月'] === undefined) return;
+
+  var data = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues() : [];
+  for (var r = 0; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (String(data[r][col['年月']]).trim() !== ym) continue;
+
+    var sheetRow = r + 2;
+    if (isFree) {
+      var newFree = (Number(data[r][col['free_used']]) || 0) + 1;
+      sheet.getRange(sheetRow, col['free_used'] + 1).setValue(newFree);
+    } else {
+      var newBillable = (Number(data[r][col['billable_count']]) || 0) + segments;
+      var newSent     = (Number(data[r][col['sent_count']])     || 0) + segments;
+      sheet.getRange(sheetRow, col['billable_count'] + 1).setValue(newBillable);
+      sheet.getRange(sheetRow, col['sent_count'] + 1).setValue(newSent);
+    }
+    if (col['更新日時'] !== undefined) sheet.getRange(sheetRow, col['更新日時'] + 1).setValue(new Date());
+    return;
+  }
+
+  // 該当行が無ければ新規作成
+  var newRow = hdr.map(function(h) {
+    if (h === 'tenant_id')       return tenantId;
+    if (h === '年月')            return ym;
+    if (h === 'sent_count')      return isFree ? 0 : segments;
+    if (h === 'free_used')       return isFree ? 1 : 0;
+    if (h === 'billable_count')  return isFree ? 0 : segments;
+    if (h === '更新日時')        return new Date();
+    return '';
+  });
+  sheet.appendRow(newRow);
+}
+
+// ────────────────────────────────────────────────────────────────────
 // calcSegments_: 本文のセグメント数(通数)計算の単一情報源。
 //   sendSingleSMSFromForm・STEP4のqueue課金計算・STEP7のフロント文字数
 //   カウンタが同じロジックを共有する。
@@ -262,12 +430,16 @@ function calcSegments_(text) {
 
 // ────────────────────────────────────────────────────────────────────
 // sendSingleSMSFromForm: CPaaS 送信ロジック本体
-//   doPost(handleSendSms_ / handleSendSmsForm_) および
-//   将来の google.script.run 両方から呼べるよう token を持たない設計
+//   doPost(handleSendSms_ / handleSendSmsForm_)・queue経由(processQueue_)
+//   および将来の google.script.run 両方から呼べるよう token を持たない設計。
+//   data.tenantId / data.batchId は省略可（logタブへの記録用。processQueue_が
+//   queue行のtenant_id/batch_idを渡す。単発送信では未指定なら会員のtenant_id
+//   を自動使用する）。
 // ────────────────────────────────────────────────────────────────────
 function sendSingleSMSFromForm(data) {
   var sender       = null;
   var normalizedTo = null;
+  var tenantIdForLog = data.tenantId || '';
   try {
     var smsAcc = getSmsAccount_(data.accountId);
     if (!smsAcc) throw new Error('送信元設定がありません。管理者に連絡してください');
@@ -279,7 +451,17 @@ function sendSingleSMSFromForm(data) {
     if (sender.length > 0 && sender.length <= 9)
       Logger.log('[WARN] sender が9桁以下 — 先頭0が欠落している可能性: "' + sender + '"');
 
-    normalizedTo = normalizePhoneNumber_(data.phoneNumber, data.countryCode || '81');
+    // 国番号ガード(addendum B): 会員のtenant_idがGSD以外なら国内(81)番号のみ許可。
+    // GSD（既存運用）・tenant_id未設定は従来通り制限しない（既存動作への影響回避を最優先）。
+    var sendMember     = getMember_(data.accountId);
+    var memberTenantId = sendMember ? sendMember.tenant_id : '';
+    if (!tenantIdForLog) tenantIdForLog = memberTenantId || '';
+    var countryCode = String(data.countryCode || '81');
+    if (memberTenantId && memberTenantId !== 'GSD' && countryCode !== '81') {
+      throw new Error('対応していない国番号です（国内番号のみご利用いただけます）');
+    }
+
+    normalizedTo = normalizePhoneNumber_(data.phoneNumber, countryCode);
 
     var text = String(data.message || '').trim();
     if (!text) throw new Error('本文が空です');
@@ -344,7 +526,8 @@ function sendSingleSMSFromForm(data) {
       'ステータス': '送信成功', 'result_code': smsJson.result_code,
       'result_message': smsJson.result_message, 'message_id': smsJson.message_id,
       'how_many_messages': smsJson.how_many_message_parts,
-      '文字数情報': text.length + ' / 660 (' + segments + ' SMS)'
+      '文字数情報': text.length + ' / 660 (' + segments + ' SMS)',
+      'tenant_id': tenantIdForLog, 'batch_id': data.batchId || ''
     });
     logAudit_(data.accountId, 'sendSms', normalizedTo, 'ok: ' + smsAcc.label);
 
@@ -363,7 +546,8 @@ function sendSingleSMSFromForm(data) {
       'from': normalizePhoneFrom_(sender),
       'to': normalizedTo || String(data.phoneNumber || ''),
       'メッセージ内容': String(data.message || ''),
-      'ステータス': 'エラー', 'result_message': e.message
+      'ステータス': 'エラー', 'result_message': e.message,
+      'tenant_id': tenantIdForLog, 'batch_id': data.batchId || ''
     });
     logAudit_(String(data.accountId || '-'), 'sendSms',
               normalizedTo || String(data.phoneNumber || '-'), 'error: ' + e.message);
@@ -413,6 +597,9 @@ function getMember_(id) {
         kaihipay_status: String(data[r][col['kaihipay_status']] || ''),
         role:            col['role'] !== undefined                      // grandfathered 判定に使用
                            ? String(data[r][col['role']] || '')
+                           : '',
+        tenant_id:       col['tenant_id'] !== undefined                 // 国番号ガード(addendum B)等に使用
+                           ? String(data[r][col['tenant_id']] || '')
                            : ''
       };
     }
@@ -793,7 +980,10 @@ function json_(obj) {
 // ────────────────────────────────────────────────────────────────────
 // log 書き込み（ヘッダー整列・自己修復・排他ロック付き）
 //   logObj は { ヘッダー名: 値 } のオブジェクト。LOG_HEADERS を唯一の真実とし、
-//   シートヘッダーが欠損・不一致なら自動修復してから書き込む。
+//   シートヘッダーが欠損・不一致なら自動修復してから書き込む（LOG_HEADERSの
+//   範囲のみ。末尾に追加された tenant_id/batch_id 列は自己修復の対象外＝触れない）。
+//   書き込み自体はシートの実際のヘッダー全体（LOG_HEADERS + 追加列）に合わせて
+//   行うため、logObj に tenant_id/batch_id を含めればそれらの列にも反映される。
 // ────────────────────────────────────────────────────────────────────
 function appendSmsLog_(logObj) {
   try {
@@ -804,7 +994,7 @@ function appendSmsLog_(logObj) {
     var lock = LockService.getScriptLock();
     lock.waitLock(10000);
     try {
-      // ヘッダー行を正規化して照合
+      // ヘッダー行を正規化して照合（LOG_HEADERSの範囲のみ）
       var norm = function(h) { return String(h).normalize('NFKC').trim(); };
       var needsRepair = true;
       if (sheet.getLastRow() >= 1 && sheet.getLastColumn() >= LOG_HEADERS.length) {
@@ -817,8 +1007,11 @@ function appendSmsLog_(logObj) {
              .setFontWeight('bold').setBackground('#f0f0f0');
       }
 
-      // LOG_HEADERS 順に値を並べる（対応なしは空文字）
-      var row = LOG_HEADERS.map(function(h) {
+      // 実際のヘッダー全体（LOG_HEADERS + tenant_id/batch_id 等の追加列）に合わせて
+      // 値を並べる（対応なしは空文字）。
+      var lastCol    = Math.max(sheet.getLastColumn(), LOG_HEADERS.length);
+      var fullHeader = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(norm);
+      var row = fullHeader.map(function(h) {
         var v = logObj[h];
         return (v === undefined || v === null) ? '' : v;
       });
@@ -1130,10 +1323,131 @@ function ensureTriggers_() {
   return { created: created, skipped: skipped };
 }
 
-// TODO: STEP4で実装予定（queueタブから送信待ちレコードを取り出しSMS送信する本体）
-// 現時点ではno-op stub（トリガー動作確認用）。
+// ────────────────────────────────────────────────────────────────────
+// processQueue_: queueタブから送信待ちレコードを取り出しSMS送信する本体（STEP4a）。
+//   5分毎のインストール型トリガーから呼ばれる想定。
+//   ・LockServiceで多重実行を防止（取得できなければ何もせず終了）。
+//   ・経過時間が4分を超えたら打ち切り、残りは次回のトリガー実行に委ねる。
+//   ・status='pending' かつ scheduled_at<=now の行を最大200件、行番号昇順で処理。
+// ────────────────────────────────────────────────────────────────────
 function processQueue_() {
-  Logger.log('[processQueue_] STEP4未実装のため no-op');
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    Logger.log('[processQueue_] ロック取得できず終了（多重実行防止）');
+    return { skipped: true, reason: 'lock_not_acquired' };
+  }
+
+  var startTime      = Date.now();
+  var MAX_RUNTIME_MS = 4 * 60 * 1000; // 4分
+  var MAX_ROWS        = 200;
+  var stats = { processed: 0, sent: 0, failed: 0, retried: 0, truncated: false, elapsedMs: 0 };
+
+  try {
+    var sheet   = getQueueSheet_();
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return stats;
+
+    var lastCol = sheet.getLastColumn();
+    var hdr     = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).trim(); });
+    var col     = {};
+    hdr.forEach(function(h, i) { col[h] = i; });
+    var data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+    var now = new Date();
+    var targetRows = []; // dataの0-basedインデックス（行番号は+2）
+    for (var i = 0; i < data.length; i++) {
+      if (targetRows.length >= MAX_ROWS) { stats.truncated = true; break; }
+      var status = String(data[i][col['status']] || '').trim();
+      if (status !== 'pending') continue;
+      var schedRaw = data[i][col['scheduled_at']];
+      var sched    = schedRaw ? new Date(schedRaw) : new Date(0);
+      if (sched > now) continue; // 予約時刻未到来 → 対象外
+      targetRows.push(i);
+    }
+
+    var tenantCache = {};
+
+    for (var t = 0; t < targetRows.length; t++) {
+      if (Date.now() - startTime > MAX_RUNTIME_MS) {
+        Logger.log('[processQueue_] 経過時間超過のため打ち切り。残りは次回のトリガー実行に委ねる。');
+        stats.truncated = true;
+        break;
+      }
+
+      var rowIdx    = targetRows[t];
+      var sheetRow  = rowIdx + 2;
+      var rowData   = data[rowIdx];
+
+      var tenantId   = String(rowData[col['tenant_id']] || '');
+      var memberId   = String(rowData[col['会員ID']] || '');
+      var to         = String(rowData[col['to']] || '');
+      var msgBody    = String(rowData[col['body']] || '');
+      var batchId    = String(rowData[col['batch_id']] || '');
+      var retryCount = Number(rowData[col['retry_count']]) || 0;
+
+      stats.processed++;
+
+      // tenant情報はqueue行のtenant_id（enqueue時点のスナップショット）から解決。
+      // tenants未登録（GSD等）は無制限扱いにフォールバック（STEP3/bulkSendと同じ方針）。
+      var tenant = tenantCache[tenantId];
+      if (tenant === undefined) {
+        tenant = getTenantById_(tenantId) || { tenant_id: 'GSD', plan: 'standard', status: 'active' };
+        tenantCache[tenantId] = tenant;
+      }
+
+      var isFree;
+      try {
+        isFree = checkSendAllowed_(tenant, 1).isFree;
+      } catch (e) {
+        // 上限到達・status不正等はリトライしても解決しないためfailed確定
+        sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
+        sheet.getRange(sheetRow, col['result'] + 1).setValue(e.message);
+        stats.failed++;
+        continue;
+      }
+
+      var sendResult = sendSingleSMSFromForm({
+        accountId:   memberId,
+        phoneNumber: to,
+        message:     msgBody,
+        countryCode: '81', // tenant_id='GSD'以外は81固定。GSD経由のqueue利用は現状想定なし
+        tenantId:    tenantId,
+        batchId:     batchId
+      });
+
+      if (sendResult.success) {
+        sheet.getRange(sheetRow, col['status'] + 1).setValue('sent');
+        sheet.getRange(sheetRow, col['result'] + 1).setValue(sendResult.result_message || '送信成功');
+        sheet.getRange(sheetRow, col['sent_at'] + 1).setValue(new Date());
+        stats.sent++;
+
+        var segments = 1;
+        try { segments = calcSegments_(msgBody) || 1; } catch (_) { segments = 1; }
+        incrementUsage_(tenantId, isFree, segments);
+
+      } else {
+        retryCount++;
+        sheet.getRange(sheetRow, col['retry_count'] + 1).setValue(retryCount);
+        sheet.getRange(sheetRow, col['result'] + 1).setValue(sendResult.message);
+        if (retryCount >= 3) {
+          sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
+          stats.failed++;
+        } else {
+          // statusは'pending'のまま据え置き（次回のprocessQueue_実行で再試行）
+          stats.retried++;
+        }
+      }
+    }
+  } catch (err) {
+    Logger.log('[processQueue_] error: ' + err.message);
+    stats.error = err.message;
+  } finally {
+    lock.releaseLock();
+  }
+
+  stats.elapsedMs = Date.now() - startTime;
+  Logger.log('[processQueue_] ' + JSON.stringify(stats));
+  return stats;
 }
 
 // TODO: STEP6で実装予定（月次締め: usage集計→invoices確定・請求処理）
@@ -1636,3 +1950,4 @@ function deleteUsageRow_(sheet, tenantId, yearMonth) {
     }
   }
 }
+
