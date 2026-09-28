@@ -773,13 +773,26 @@ function renderApp() {
 
 // ── テナント状況表示（STEP7b: myTenantStatus） ──────────────────────
 //   GSD会員(tenant_id='GSD'、tenant管理外の会員も同様に扱われる)では
-//   表示自体を出さない（既存UIを変えないため）。
-//   ※ free_used の上限(freeLimit)は myTenantStatus のレスポンスに含まれない
-//     ため、api.js の PLAN_LIMITS.freeLimit と同じ値をここに明示する。
-//     両プランとも現状30のためこの値で共通化しているが、api.js側の値を
-//     変更した場合はここも合わせて変更すること（単一情報源にできず、
-//     判断に迷った点として実装報告に記載済み）。
+//   表示自体を出さない（既存UIを変えないため。account-label/countryCodeの
+//   表示もGSD会員は一切変更しない）。
+//   ※ free_used の上限(freeLimit)は myTenantStatus のレスポンスの
+//     trial_free_limit を優先して使う。取得できない場合のみ、
+//     api.js の PLAN_LIMITS.freeLimit と同じ値であるこの定数へフォールバックする
+//     （両プランとも現状30。api.js側の値を変更した場合はここも合わせて
+//     変更すること。単一情報源にできず、判断に迷った点として実装報告に記載済み）。
 const TENANT_STATUS_FREE_LIMIT = 30;
+
+// 電話番号の表示用フォーマット（ハイフン挿入）。厳密な市外局番判定ではなく
+// 簡易的な桁数ベースの整形（10桁: 2-4-4 or 3-3-4 / 11桁: 3-4-4）。
+function formatPhoneDisplay(raw) {
+  const s = String(raw || '').replace(/[^0-9]/g, '');
+  if (s.length === 10) {
+    if (/^0[3-6]/.test(s)) return s.slice(0, 2) + '-' + s.slice(2, 6) + '-' + s.slice(6);
+    return s.slice(0, 3) + '-' + s.slice(3, 6) + '-' + s.slice(6);
+  }
+  if (s.length === 11) return s.slice(0, 3) + '-' + s.slice(3, 7) + '-' + s.slice(7);
+  return s;
+}
 
 async function loadTenantStatus() {
   const el = document.getElementById('tenant-status-badge');
@@ -789,12 +802,32 @@ async function loadTenantStatus() {
     const data = await callApi('myTenantStatus', {});
     if (!data.ok || !data.result) return;
     const r = data.result;
-    if (!r.tenant_id || r.tenant_id === 'GSD') return; // GSD・tenant管理外は非表示
+    if (!r.tenant_id || r.tenant_id === 'GSD') return; // GSD・tenant管理外は非表示（以降の表示変更も行わない）
 
-    const planLabel = r.plan === 'standard' ? 'standard' : 'light';
+    // fix/tenant-send: テナント会員の送信元カードは会員IDではなく
+    // 「会社名」＋「登録済み送信元番号」（無ければフォールバック中の案内）で表示する。
+    const companyName = r['会社名'] || '';
+    const accountLabelEl = document.getElementById('account-label');
+    if (accountLabelEl) {
+      const senderText = r.registeredSenderNumber
+        ? formatPhoneDisplay(r.registeredSenderNumber)
+        : 'テスト用共通番号（番号登録手続き中）';
+      accountLabelEl.textContent = companyName ? `${companyName} ・ ${senderText}` : senderText;
+    }
+
+    // fix/tenant-send: テナント会員は国番号セレクタを隠して+81固定にする
+    // （サーバ側の国番号ガードaddendum Bは実装済み。ここはUI側の対応）。
+    const countrySelect = document.getElementById('countryCode');
+    if (countrySelect) {
+      countrySelect.classList.add('hidden');
+      countrySelect.value = '81';
+    }
+
+    const planLabel = r.plan === 'standard' ? 'スタンダード' : 'ライト';
     let text = `プラン: ${planLabel} ・ 今月の送信 ${r.sent_count || 0}件`;
     if (r.status === 'trial') {
-      const remain = Math.max(0, TENANT_STATUS_FREE_LIMIT - (Number(r.free_used) || 0));
+      const freeLimit = Number(r.trial_free_limit) > 0 ? Number(r.trial_free_limit) : TENANT_STATUS_FREE_LIMIT;
+      const remain = Math.max(0, freeLimit - (Number(r.free_used) || 0));
       text += ` ・ 残り無料枠 ${remain}件`;
     }
     let html = escHtml(text);
