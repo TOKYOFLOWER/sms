@@ -561,7 +561,7 @@ function sendSingleSMSFromForm(data) {
       muteHttpExceptions: true
     });
     if (authRes.getResponseCode() !== 200)
-      throw new Error('CPaaS 認証エラー: ' + authRes.getResponseCode());
+      throw new Error('SMS送信サービスへの認証に失敗しました（コード: ' + authRes.getResponseCode() + '）');
     var jwtToken = JSON.parse(authRes.getContentText()).jwt_token;
 
     // 送信前ログ（secret / JWT は出さない）
@@ -1022,6 +1022,16 @@ function normalizePhoneFrom_(num) {
   if (s.indexOf('+81') === 0) s = '0' + s.slice(3);
   if (/^\d{8,10}$/.test(s) && s.charAt(0) !== '0') s = '0' + s;
   return s;
+}
+
+// 電話番号の桁数チェック（申込フォーム: 担当者電話・送信元電話番号 共通）。
+// docs/signup.html の isValidPhoneDigits とルールを揃えている（フロント/サーバ二重検証）。
+// 数字とハイフンのみ許可。ハイフン除去後の桁数が10桁(固定・IP電話)または11桁(携帯)以外は無効。
+function isValidPhoneDigits_(raw) {
+  var s = String(raw || '').trim();
+  if (!/^[0-9-]+$/.test(s)) return false;
+  var digits = s.replace(/-/g, '');
+  return digits.length === 10 || digits.length === 11;
 }
 
 function rateLimitCheck_(id) {
@@ -2958,7 +2968,7 @@ function handleSignup_(body) {
   if (!contactPhone) missing.push('担当者電話');
   if (!address) missing.push('住所');
   if (!senderNumbersRaw.length) missing.push('送信元電話番号（1件以上）');
-  if (!numberOwner) missing.push('番号名義');
+  if (!numberOwner) missing.push('送信元番号の契約名義');
   if (!plan) missing.push('plan');
   if (missing.length) {
     throw new Error('未入力の項目があります: ' + missing.join('、'));
@@ -2971,6 +2981,21 @@ function handleSignup_(body) {
   }
   if (!agreeTerms) throw new Error('利用規約への同意が必要です');
   if (!agreeEmailLaw) throw new Error('特定電子メール法に基づく表示への同意が必要です');
+
+  // 電話番号の桁数チェック（フロント側 docs/signup.html の isValidPhoneDigits と同じルール）。
+  // 数字とハイフンのみ許可。ハイフン除去後の桁数が10桁(固定・IP電話)または11桁(携帯)以外は無効。
+  if (!isValidPhoneDigits_(contactPhone)) {
+    throw new Error('担当者電話の桁数が正しくありません（ハイフンを除いた数字が10桁または11桁になるように入力してください）');
+  }
+  senderNumbersRaw.forEach(function(raw, idx) {
+    var s = String(raw || '').trim();
+    if (!isValidPhoneDigits_(s)) {
+      throw new Error('送信元電話番号（' + (idx + 1) + '件目）の桁数が正しくありません（ハイフンを除いた数字が10桁または11桁になるように入力してください）');
+    }
+    if (s.replace(/-/g, '').charAt(0) !== '0') {
+      throw new Error('送信元電話番号（' + (idx + 1) + '件目）は「0」から始まる番号をご入力ください');
+    }
+  });
 
   var normalizedNumbers = senderNumbersRaw
     .map(function(n) { return normalizePhoneFrom_(n); })
