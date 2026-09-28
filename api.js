@@ -71,7 +71,9 @@ var SCHEMA = [
       'plan', 'status', '申込日', 'trial_end', 'trial_free_limit',
       'fincode_customer_id', 'fincode_card_id', 'daily_limit', 'created_at', 'updated_at',
       // STEP7: 申込フォーム(action=signup)で追加投入する項目
-      '業種', '想定月間送信数', '紹介元', '規約同意', '特定電子メール法同意'
+      '業種', '想定月間送信数', '紹介元', '規約同意', '特定電子メール法同意',
+      // 積み残し2件目: 送信元番号pending中のフォールバック送信元キャッシュ
+      'fallback_sms_account_key'
     ]
   },
   {
@@ -236,11 +238,17 @@ function handleSendSms_(body) {
 
   rateLimitCheck_(id);
 
+  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member);
+  if (!effectiveAccountId) {
+    throw new Error('送信元番号の準備中です。しばらくお待ちください');
+  }
+
   var result = sendSingleSMSFromForm({
-    accountId:   id,
-    phoneNumber: body.to,
-    message:     body.text,
-    countryCode: '81'
+    accountId:    id,
+    smsAccountId: effectiveAccountId,
+    phoneNumber:  body.to,
+    message:      body.text,
+    countryCode:  '81'
   });
   if (!result.success) throw new Error(result.message);
   return { segments: result.how_many_message_parts, message: result.result_message };
@@ -254,14 +262,33 @@ function handleSendSmsForm_(body) {
   if (!member || !isEntitled_(member))
     throw new Error('ご契約が有効でないか、送信権限がありません');
   rateLimitCheck_(id);
+
+  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member);
+  if (!effectiveAccountId) {
+    throw new Error('送信元番号の準備中です。しばらくお待ちください');
+  }
+
   var result = sendSingleSMSFromForm({
-    accountId:   id,
-    phoneNumber: body.to,
-    message:     body.text,
-    countryCode: String(body.countryCode || '81')
+    accountId:    id,
+    smsAccountId: effectiveAccountId,
+    phoneNumber:  body.to,
+    message:      body.text,
+    countryCode:  String(body.countryCode || '81')
   });
   if (!result.success) throw new Error(result.message);
   return result;
+}
+
+// resolveEffectiveAccountId_ を例外で落とさず呼び出すラッパー（handleSendSms_/handleSendSmsForm_用）。
+//   途中で何らかのエラーが起きても「準備中」扱いにして安全側に倒す（絶対に例外で落ちないこと）。
+function resolveEffectiveSmsAccountIdSafe_(member) {
+  try {
+    var tenant = resolveTenantForMember_(member);
+    return resolveEffectiveAccountId_(member, tenant);
+  } catch (e) {
+    Logger.log('[resolveEffectiveSmsAccountIdSafe_] error: ' + e.message);
+    return null;
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -451,13 +478,18 @@ function calcSegments_(text) {
 //   data.tenantId / data.batchId は省略可（logタブへの記録用。processQueue_が
 //   queue行のtenant_id/batch_idを渡す。単発送信では未指定なら会員のtenant_id
 //   を自動使用する）。
+//   data.smsAccountId は省略可（積み残し2件目: 送信元番号pending中の共通テスト
+//   番号フォールバック用）。指定があればCPaaS認証情報・送信元番号の解決に
+//   data.accountIdの代わりにこちらを使う。ログの「会員ID」・logAudit_・
+//   国番号ガードの判定は常にdata.accountId（実際の会員ID）を使い続けるため、
+//   送信履歴(listHistory)の紐付けは一切変わらない。
 // ────────────────────────────────────────────────────────────────────
 function sendSingleSMSFromForm(data) {
   var sender       = null;
   var normalizedTo = null;
   var tenantIdForLog = data.tenantId || '';
   try {
-    var smsAcc = getSmsAccount_(data.accountId);
+    var smsAcc = getSmsAccount_(data.smsAccountId || data.accountId);
     if (!smsAcc) throw new Error('送信元設定がありません。管理者に連絡してください');
     if (String(smsAcc.enabled).toUpperCase() !== 'TRUE')
       throw new Error('送信が一時停止されています。管理者に連絡してください');
@@ -1471,13 +1503,29 @@ function processQueue_() {
         continue;
       }
 
+      // 積み残し2件目: 送信元番号pending中は共通テスト番号へフォールバック。
+      // 未設定でnullが返る場合は「準備中」としてfailed確定（リトライしても解決しないため）。
+      var effectiveAccountId;
+      try {
+        effectiveAccountId = resolveEffectiveAccountId_({ id: memberId }, tenant);
+      } catch (e) {
+        effectiveAccountId = null;
+      }
+      if (!effectiveAccountId) {
+        sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
+        sheet.getRange(sheetRow, col['result'] + 1).setValue('送信元番号の準備中です。しばらくお待ちください');
+        stats.failed++;
+        continue;
+      }
+
       var sendResult = sendSingleSMSFromForm({
-        accountId:   memberId,
-        phoneNumber: to,
-        message:     msgBody,
-        countryCode: '81', // tenant_id='GSD'以外は81固定。GSD経由のqueue利用は現状想定なし
-        tenantId:    tenantId,
-        batchId:     batchId
+        accountId:    memberId,
+        smsAccountId: effectiveAccountId,
+        phoneNumber:  to,
+        message:      msgBody,
+        countryCode:  '81', // tenant_id='GSD'以外は81固定。GSD経由のqueue利用は現状想定なし
+        tenantId:     tenantId,
+        batchId:      batchId
       });
       stats.apiCalls++; // addendum F: usage_system記録用（実際の送信試行回数）
 
@@ -2150,6 +2198,75 @@ function resolveTenantForMember_(member) {
   return getTenantById_(tenantId) || { tenant_id: 'GSD', plan: 'standard', status: 'active' };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// 積み残し2件目: 送信元番号pending中の共通テスト番号でのフォールバック送信
+// ────────────────────────────────────────────────────────────────────
+
+// sender_numbersタブに該当tenant_idのstatus='registered'行が1件でもあるか
+function hasRegisteredSenderNumber_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('sender_numbers');
+  if (!sheet || sheet.getLastRow() < 2) return false;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['status'] === undefined) return false;
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (String(data[r][col['status']]).trim().toLowerCase() === 'registered') return true;
+  }
+  return false;
+}
+
+// tenantsタブのfallback_sms_account_key列を更新する（キャッシュ目的。内部専用）
+function setTenantFallbackSmsAccountKey_(tenantId, key) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet) return false;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['fallback_sms_account_key'] === undefined) return false;
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    sheet.getRange(r + 1, col['fallback_sms_account_key'] + 1).setValue(key);
+    return true;
+  }
+  return false;
+}
+
+// resolveEffectiveAccountId_: sendSingleSMSFromFormのsmsAccountId解決に使う実効アカウントIDを返す。
+//   ・tenant管理外（GSD含む、tenants未登録）は従来通りmember.idをそのまま返す
+//     （既存動作を一切変えない）。
+//   ・tenant管理下でhasRegisteredSenderNumber_がtrueならmember.idを返す
+//     （自番号。既存の「1会員1送信元(sms_accounts)」の仕組みのまま）。
+//   ・registeredが1件も無い場合、Script Property COMMON_TEST_SENDER_KEY
+//     （getPropOptional_で取得。無ければtenant.fallback_sms_account_keyを見る）
+//     を返す。取得できた場合はtenants.fallback_sms_account_key列にキャッシュする。
+//   ・最終的にnullなら「送信元番号の準備中」を意味し、呼び出し元でエラー処理すること。
+function resolveEffectiveAccountId_(member, tenant) {
+  if (!tenant || String(tenant.tenant_id).trim() === 'GSD') {
+    return member.id; // tenant管理外(GSD含む)は従来通り自番号
+  }
+
+  if (hasRegisteredSenderNumber_(tenant.tenant_id)) {
+    return member.id; // 自番号（registered済みなのでこの会員のsms_accounts行が用意されている前提）
+  }
+
+  var commonKey = getPropOptional_('COMMON_TEST_SENDER_KEY') || tenant.fallback_sms_account_key || null;
+  if (commonKey && !tenant.fallback_sms_account_key) {
+    setTenantFallbackSmsAccountKey_(tenant.tenant_id, commonKey); // キャッシュ（無くても機能に影響しない）
+    tenant.fallback_sms_account_key = commonKey;
+  }
+  return commonKey || null;
+}
+
 // token検証 + 会員の有効性確認をまとめたヘルパー（STEP5a各actionで共通）
 function requireEntitledMember_(body) {
   var claims = verifyToken_(body.token);
@@ -2212,6 +2329,12 @@ function handleMyTenantStatus_(body) {
     dailyLimit = Number(tenant.daily_limit) > 0 ? Number(tenant.daily_limit) : limits.dailyLimit;
   }
 
+  // 積み残し2件目: 送信元番号がregistered済みでないテナントには案内文言を返す
+  var senderNumberNotice = null;
+  if (!isGsd && !hasRegisteredSenderNumber_(tenant.tenant_id)) {
+    senderNumberNotice = '番号登録申請中（約2週間）：テスト用共通番号で送信されます';
+  }
+
   return {
     tenant_id:   tenant.tenant_id,
     plan:        tenant.plan || 'standard',
@@ -2219,7 +2342,8 @@ function handleMyTenantStatus_(body) {
     free_used:   usage.free_used,
     sent_count:  usage.sent_count,
     daily_limit: dailyLimit,
-    todaySent:   countTodaySent_(tenant.tenant_id)
+    todaySent:   countTodaySent_(tenant.tenant_id),
+    senderNumberNotice: senderNumberNotice
   };
 }
 
@@ -2372,7 +2496,14 @@ function handleListSenderNumbers_(body) {
     }
     out.push(obj);
   }
-  return { senderNumbers: out };
+
+  // 積み残し2件目: registered済みが1件も無い場合は案内文言も併せて返す（myTenantStatusと同文言）
+  var hasRegistered = out.some(function(o) { return o.usable; });
+  var notice = null;
+  if (String(tenantId).trim() !== 'GSD' && !hasRegistered) {
+    notice = '番号登録申請中（約2週間）：テスト用共通番号で送信されます';
+  }
+  return { senderNumbers: out, hasRegisteredSenderNumber: hasRegistered, notice: notice };
 }
 
 // ── 履歴CSVエクスポート ──────────────────────────────────────────

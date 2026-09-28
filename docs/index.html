@@ -797,7 +797,12 @@ async function loadTenantStatus() {
       const remain = Math.max(0, TENANT_STATUS_FREE_LIMIT - (Number(r.free_used) || 0));
       text += ` ・ 残り無料枠 ${remain}件`;
     }
-    el.textContent = text;
+    let html = escHtml(text);
+    // 積み残し2件目: 送信元番号がregistered済みでない場合の案内文言（追記のみ、既存表示は変えない）
+    if (r.senderNumberNotice) {
+      html += `<br><span style="color:var(--gold)">${escHtml(r.senderNumberNotice)}</span>`;
+    }
+    el.innerHTML = html;
     el.classList.remove('hidden');
   } catch (_) {
     // 取得失敗時は静かに非表示のまま（既存の送信フローを妨げない）
