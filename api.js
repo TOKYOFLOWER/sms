@@ -1337,17 +1337,85 @@ function backupSpreadsheet_() {
   var masterId = getProp_('MASTER_SHEET_ID');
   var smsId    = getProp_('SMS_SHEET_ID');
 
-  var masterCopy = DriveApp.getFileById(masterId).makeCopy('sms_backup_master_' + dateStr);
-  var smsCopy    = DriveApp.getFileById(smsId).makeCopy('sms_backup_sms_' + dateStr);
+  var masterBackupId = copySpreadsheetValuesOnly_(masterId, 'sms_backup_master_' + dateStr);
+  var smsBackupId    = copySpreadsheetValuesOnly_(smsId, 'sms_backup_sms_' + dateStr);
 
   var result = {
     date: dateStr,
-    masterBackupId: masterCopy.getId(),
-    smsBackupId: smsCopy.getId()
+    masterBackupId: masterBackupId,
+    smsBackupId: smsBackupId
   };
   Logger.log('[backupSpreadsheet_] master backup id: ' + result.masterBackupId);
   Logger.log('[backupSpreadsheet_] sms backup id: '    + result.smsBackupId);
   return result;
+}
+
+// 元のスプレッドシートの全タブを、新規作成したスプレッドシートへ「値だけ」複製する。
+//   DriveApp.getFileById(id).makeCopy(...) だとコンテナバインドのApps Script
+//   プロジェクトまで複製されてしまい、Apps Scriptの一覧に同名プロジェクトが増えて
+//   本番と見分けがつかなくなる問題があった。SpreadsheetApp.create()で作る新規
+//   スプレッドシートにはバインドスクリプトが一切存在しないため、この方式に変更した。
+//
+//   ※ 当初は sheet.copyTo(newSs) を使う実装にしていたが、行数の多いタブ（本番の
+//     master.log タブ＝3万行超）で copyTo が "ドキュメントを開けませんでした" という
+//     内部エラーで確実に失敗することを検証で確認した（他の1000行未満のタブは成功する
+//     ため、行数・セル数に起因する制限と判断）。そのため copyTo は使わず、
+//     getValues()/getNumberFormats() で値と書式（'@'テキスト書式等）だけを読み取り、
+//     setNumberFormats()→setValues() の順で新規シートへ書き込む方式に変更した。
+//     これは名前どおり「値だけの複製」であり、大きいタブでも確実に動作する。
+//   書式は setNumberFormats() で明示的に複製する。'@'（テキスト）書式のセルで
+//   数字だけの文字列は、setValues() 時にGASが数値へ自動変換し先頭ゼロが失われる
+//   既知の問題があるため、先頭に ' を付与してテキストとして強制保存する
+//   （forceTextValue_ と同じ考え方）。
+var BACKUP_MAX_CELL_CHARS_ = 49000; // Sheetsの1セル最大50,000文字制限に対する安全マージン
+
+function copySpreadsheetValuesOnly_(sourceId, newName) {
+  var sourceSs = SpreadsheetApp.openById(sourceId);
+  var newSs    = SpreadsheetApp.create(newName);
+  var defaultSheet = newSs.getSheets()[0]; // 新規作成時の初期シート（複製完了後に削除）
+
+  sourceSs.getSheets().forEach(function(sheet) {
+    var newSheet = newSs.insertSheet(sheet.getName());
+    var lastRow = sheet.getLastRow();
+    var lastCol = sheet.getLastColumn();
+    if (lastCol > 0) {
+      // 列全体（データが無い将来の行を含む）の書式を複製する。
+      // sender_numbers.電話番号列・queue.from列等は、データがまだ無くても
+      // 列全体に'@'（テキスト）書式が事前設定されているケースがあるため、
+      // データ行(lastRow)だけでなくシートの最大行(maxRows)まで複製する。
+      var maxRows    = sheet.getMaxRows();
+      var allFormats = sheet.getRange(1, 1, maxRows, lastCol).getNumberFormats();
+      newSheet.getRange(1, 1, maxRows, lastCol).setNumberFormats(allFormats);
+
+      if (lastRow > 0) {
+        var values  = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+        var formats = allFormats; // 先頭lastRow行分だけ参照すればよい
+
+        for (var r = 0; r < values.length; r++) {
+          for (var c = 0; c < values[r].length; c++) {
+            var v = values[r][c];
+            if (typeof v === 'string') {
+              if (formats[r][c] === '@' && /^\d+$/.test(v)) {
+                values[r][c] = "'" + v;
+              } else if (v.length > BACKUP_MAX_CELL_CHARS_) {
+                // Google Sheetsの1セル最大文字数(50,000)制限のため、
+                // 元データがそれを超える異常値の場合は書き込み時にエラーになる。
+                // バックアップ処理全体を失敗させないよう安全マージンを取って切り詰める。
+                values[r][c] = v.substring(0, BACKUP_MAX_CELL_CHARS_) +
+                  '...[TRUNCATED_FOR_BACKUP: original ' + v.length + ' chars, exceeds Sheets 50,000-char cell limit]';
+              }
+            }
+          }
+        }
+
+        newSheet.getRange(1, 1, lastRow, lastCol).setValues(values);
+      }
+    }
+  });
+
+  newSs.deleteSheet(defaultSheet);
+
+  return newSs.getId();
 }
 
 // ────────────────────────────────────────────────────────────────────
