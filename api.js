@@ -29,7 +29,9 @@ var SCHEMA = [
   {
     sheetProp: 'MASTER_SHEET_ID', tab: 'api_key',
     headers: null,
-    appendHeaders: ['tenant_id', 'role']
+    // tenant_role: 商用化のテナント内ロール(owner|staff)。
+    // entitlement判定に使う既存の role 列（grandfathered等）とは別物なので列名を分離している。
+    appendHeaders: ['tenant_id', 'tenant_role']
   },
   {
     sheetProp: 'SMS_SHEET_ID', tab: 'log',
@@ -837,7 +839,7 @@ function handleListHistory_(body) {
 //   ・シートが無ければ作成しヘッダー設定（新規タブのみ。既存必須タブは作らない）
 //   ・シートがあればヘッダー行を読み取り、不足している列だけを末尾に追加
 //   ・既存列の内容・順序は一切変更しない
-//   ・会員マスタ(api_key)への tenant_id="GSD" / role="owner" デフォルト投入も実施
+//   ・会員マスタ(api_key)への tenant_id="GSD" / tenant_role="owner" デフォルト投入も実施
 // ────────────────────────────────────────────────────────────────────
 function ensureSchema_() {
   var report = SCHEMA.map(function(entry) {
@@ -913,9 +915,11 @@ function applyPhoneFormat_(sheet, headerSlice, phoneColumns, startCol) {
   });
 }
 
-// 会員マスタ(api_key)の既存全行に対し、tenant_id/role の空欄をデフォルト値で埋める（冪等）
+// 会員マスタ(api_key)の既存全行に対し、tenant_id/tenant_role の空欄をデフォルト値で埋める（冪等）
 //   既に値がある行は上書きしない。列自体が無ければ何もしない
 //   （ensureSheetSchema_ が先に api_key タブへ列追加している前提）。
+//   ※ tenant_role は商用化のテナント内ロール(owner|staff)。entitlement判定に使う
+//     既存の role 列（grandfathered等、isEntitled_ が参照）とは別物であり、一切触れない。
 function ensureMemberDefaults_() {
   var ss    = SpreadsheetApp.openById(getProp_('MASTER_SHEET_ID'));
   var sheet = ss.getSheetByName('api_key');
@@ -928,7 +932,7 @@ function ensureMemberDefaults_() {
   var norm    = function(h) { return String(h).normalize('NFKC').trim(); };
   var hdr     = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(norm);
   var tenantCol = hdr.indexOf('tenant_id');
-  var roleCol   = hdr.indexOf('role');
+  var roleCol   = hdr.indexOf('tenant_role'); // テナント内ロール列。entitlement用の既存 role 列とは別物
   if (tenantCol === -1 || roleCol === -1) {
     return { tab: 'api_key', action: 'columns_missing', tenantCol: tenantCol, roleCol: roleCol };
   }
