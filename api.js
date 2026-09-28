@@ -1058,12 +1058,41 @@ function json_(obj) {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// truncateString_: 巨大な値がログシート・顧客向けAPIレスポンスに紛れ込むのを
+//   防ぐための汎用切り詰めヘルパー。超過時は末尾に「…[truncated N chars]」を
+//   付与する（Nは切り詰め前の元の文字数）。
+// ────────────────────────────────────────────────────────────────────
+function truncateString_(v, maxLen) {
+  if (v === undefined || v === null) return '';
+  var s = String(v);
+  if (s.length > maxLen) {
+    return s.substring(0, maxLen) + '…[truncated ' + s.length + ' chars]';
+  }
+  return s;
+}
+
+// appendSmsLog_の1フィールドあたりの上限文字数。Sheetsの1セル最大文字数(50,000)
+// よりも大幅に小さい値にすることで、万一CPaaSレスポンス全文やエラースタック等
+// 巨大な値が渡された場合でもログシートの肥大化・書き込みエラーを防ぐ
+// （通常のSMS本文はSMS_RULES.MAX=660文字のためこの上限では一切切り詰められない）。
+var LOG_FIELD_MAX_CHARS_ = 2000;
+
+// 顧客向けAPIレスポンス（listHistory/exportHistory/monthlyReport等）の
+// 1文字列フィールドあたりの上限文字数。巨大な値を返さないための安全策。
+var API_RESPONSE_FIELD_MAX_CHARS_ = 500;
+
+// ────────────────────────────────────────────────────────────────────
 // log 書き込み（ヘッダー整列・自己修復・排他ロック付き）
 //   logObj は { ヘッダー名: 値 } のオブジェクト。LOG_HEADERS を唯一の真実とし、
 //   シートヘッダーが欠損・不一致なら自動修復してから書き込む（LOG_HEADERSの
 //   範囲のみ。末尾に追加された tenant_id/batch_id 列は自己修復の対象外＝触れない）。
 //   書き込み自体はシートの実際のヘッダー全体（LOG_HEADERS + 追加列）に合わせて
 //   行うため、logObj に tenant_id/batch_id を含めればそれらの列にも反映される。
+//   再発防止(addendum): 全フィールドをString化したうえLOG_FIELD_MAX_CHARS_で
+//   切り詰める。呼び出し元は既にCPaaSレスポンスの生テキストやエラースタック
+//   全体ではなく、result_code/result_message/message_id等の必要最小限の値のみ
+//   を渡す設計になっているが、想定外に巨大な値が渡された場合でもシートが
+//   壊れないようにする最終防衛ラインとしてここでも切り詰めを行う。
 // ────────────────────────────────────────────────────────────────────
 function appendSmsLog_(logObj) {
   try {
@@ -1088,12 +1117,11 @@ function appendSmsLog_(logObj) {
       }
 
       // 実際のヘッダー全体（LOG_HEADERS + tenant_id/batch_id 等の追加列）に合わせて
-      // 値を並べる（対応なしは空文字）。
+      // 値を並べる（対応なしは空文字）。全フィールドString化＋切り詰め。
       var lastCol    = Math.max(sheet.getLastColumn(), LOG_HEADERS.length);
       var fullHeader = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(norm);
       var row = fullHeader.map(function(h) {
-        var v = logObj[h];
-        return (v === undefined || v === null) ? '' : v;
+        return truncateString_(logObj[h], LOG_FIELD_MAX_CHARS_);
       });
       sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
     } finally {
@@ -1142,9 +1170,9 @@ function handleListHistory_(body) {
     var dtStr = dt instanceof Date ? dt.toISOString() : String(dt || '');
     rows.push({
       dt:  dtStr,
-      to:  toCol  !== undefined ? String(data[r][toCol]  || '') : '',
-      msg: msgCol !== undefined ? String(data[r][msgCol] || '') : '',
-      st:  stCol  !== undefined ? String(data[r][stCol]  || '') : ''
+      to:  toCol  !== undefined ? truncateString_(data[r][toCol],  API_RESPONSE_FIELD_MAX_CHARS_) : '',
+      msg: msgCol !== undefined ? truncateString_(data[r][msgCol], API_RESPONSE_FIELD_MAX_CHARS_) : '',
+      st:  stCol  !== undefined ? truncateString_(data[r][stCol],  API_RESPONSE_FIELD_MAX_CHARS_) : ''
     });
   }
 
@@ -1746,6 +1774,14 @@ function dailyResetCheck_() {
 //       追加列も含めてヘッダーごとコピーする（appendSmsLog_と同じ列構成）。
 //     - 大量行のバッチ削除はGASの実行時間制限に注意し、
 //       processQueue_同様に複数回のトリガー実行に分割する設計にすること。
+//     - addendum H(巨大セル再発防止): アーカイブ先タブへコピーする前に、
+//       1セルの値がSheetsの1セル最大文字数(50,000)を超えていないか確認し、
+//       超過している場合は安全マージンを取って切り詰めてからコピーすること
+//       （backupSpreadsheet_の copySpreadsheetValuesOnly_ で採用した
+//       BACKUP_MAX_CELL_CHARS_ 切り詰めロジックと同じ方針）。他システム由来の
+//       異常値（例: master.logタブに存在した外部API生レスポンス由来の
+//       数百万文字セル）が万一logタブに混入した場合でも、アーカイブ処理の
+//       書き込みエラーを防ぐため。
 //   現時点では上記の本実装は行わず、閾値判定とログ警告のみの安全なno-opとする。
 function archiveLog_() {
   var ARCHIVE_THRESHOLD_ROWS = 500000;
@@ -2819,9 +2855,9 @@ function handleExportHistory_(body) {
 
     lines.push(toCsvLine_([
       dtStr,
-      toCol  !== undefined ? String(data[r][toCol]  || '') : '',
-      msgCol !== undefined ? String(data[r][msgCol] || '') : '',
-      stCol  !== undefined ? String(data[r][stCol]  || '') : ''
+      toCol  !== undefined ? truncateString_(data[r][toCol],  API_RESPONSE_FIELD_MAX_CHARS_) : '',
+      msgCol !== undefined ? truncateString_(data[r][msgCol], API_RESPONSE_FIELD_MAX_CHARS_) : '',
+      stCol  !== undefined ? truncateString_(data[r][stCol],  API_RESPONSE_FIELD_MAX_CHARS_) : ''
     ]));
   }
 
@@ -2878,7 +2914,10 @@ function handleMonthlyReport_(body) {
   var deliveryRate = total === 0 ? 100 : Math.round((sentCount / total) * 10000) / 100; // % (小数2桁)
 
   return {
-    '年月':     yearMonth,
+    // 年月はyyyyMM形式(6桁)の正規表現チェック済みのため実質的に切り詰められないが、
+    // 他の文字列フィールドと同様に念のためtruncateString_を通す。
+    // sent_count/到達率/分割通数は数値のためString化・切り詰めの対象外。
+    '年月':     truncateString_(yearMonth, API_RESPONSE_FIELD_MAX_CHARS_),
     sent_count: usage.sent_count,
     '到達率':   deliveryRate,
     '分割通数': usage.sent_count
