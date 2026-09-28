@@ -82,7 +82,11 @@ var SCHEMA = [
       // 積み残し2件目: 送信元番号pending中のフォールバック送信元キャッシュ
       'fallback_sms_account_key',
       // 積み残し追加分: フォールバック送信回数カウンタ（trial無料枠とは独立）
-      'fallback_send_count'
+      'fallback_send_count',
+      // feat/fincode: カード表示用（末尾4桁・有効期限のみ。フルのカード番号・
+      // セキュリティコードは一切保存しない。fincode側のcard_no/expireレスポンスの
+      // うち末尾4桁だけを抽出して保存する）。
+      'card_last4', 'card_expire'
     ]
   },
   {
@@ -116,7 +120,9 @@ var SCHEMA = [
     headers: [
       'invoice_id', 'tenant_id', '年月', 'plan', 'sent_count', 'included',
       'overage_count', 'base_fee', 'overage_fee', 'subtotal', 'tax', 'total',
-      'fincode_order_id', 'status', 'charged_at'
+      'fincode_order_id', 'status', 'charged_at',
+      // feat/fincode: 決済失敗時の再試行スケジュール（3日後再試行・2回連続失敗でsuspended）
+      'retry_at', 'retry_count'
     ]
   },
   {
@@ -161,6 +167,10 @@ function doPost(e) {
       case 'monthlyReport':        result = handleMonthlyReport_(body);        break;
       case 'myTenantStatus':       result = handleMyTenantStatus_(body);       break;
 
+      // ---- feat/fincode: カード登録（token必須。GSD会員は利用不可） ----
+      case 'fincodeConfig':        result = handleFincodeConfig_(body);        break;
+      case 'registerCard':         result = handleRegisterCard_(body);         break;
+
       // ---- STEP2: 管理API（すべて requireAdmin_ で ADMIN_SECRET 必須。bootstrapAdminのみ例外） ----
       case 'bootstrapAdmin':       result = handleBootstrapAdmin_(body);       break;
       case 'setup':                result = handleAdminSetup_(body);           break;
@@ -170,6 +180,11 @@ function doPost(e) {
       case 'updateSenderNumber':   result = handleUpdateSenderNumber_(body);   break;
       case 'listSenderNumbersAdmin': result = handleListSenderNumbersAdmin_(body); break;
       case 'issueAccount':         result = handleIssueAccount_(body);         break;
+      // ---- feat/fincode: 月次請求（すべてrequireAdmin_） ----
+      case 'closeMonthDryRun':     result = handleCloseMonthDryRun_(body);     break;
+      case 'closeMonthRun':        result = handleCloseMonthRun_(body);        break;
+      case 'listInvoices':         result = handleListInvoices_(body);         break;
+      case 'retryInvoice':         result = handleRetryInvoice_(body);         break;
 
       default: throw new Error('unknown action: ' + action);
     }
@@ -1491,6 +1506,208 @@ function getPropOptional_(key) {
   return PropertiesService.getScriptProperties().getProperty(key);
 }
 
+// ────────────────────────────────────────────────────────────────────
+// feat/fincode: カード決済連携（fincode REST API）。
+//   Script Properties: FINCODE_API_KEY（秘密鍵。サーバ側のみで使用し、
+//   フロントへは絶対に渡さない）・FINCODE_PUBLIC_KEY（公開鍵。フロントの
+//   トークン化に必要なため渡してよい）・FINCODE_SHOP_ID・FINCODE_ENV
+//   （'test'|'live'）。
+//   セキュリティ方針: カード番号・セキュリティコードは一切このサーバ
+//   （api.js／GAS／Sheets）を経由しない。フロント(docs/card.html)の
+//   fincode JS SDKがブラウザ内でトークン化し、サーバはtoken文字列のみを
+//   受け取ってfincode APIへ渡す。fincodeからのレスポンス（マスク済みの
+//   card_no等）もログには一切出力しない。card_no下4桁のみtenantsへ保存する。
+// ────────────────────────────────────────────────────────────────────
+var CARD_PAGE_URL = 'https://sms.ginzasugiden.com/card.html';
+
+function fincodeBaseUrl_() {
+  var env = String(getPropOptional_('FINCODE_ENV') || 'test').trim().toLowerCase();
+  return (env === 'live' || env === 'production') ? 'https://api.fincode.jp' : 'https://api.test.fincode.jp';
+}
+
+// fincode REST APIへの低レベルラッパー。レスポンス本文はJSONとして返すのみで
+// 一切ログに出力しない（カード情報が万一含まれていても記録に残さないため）。
+function fincodeRequest_(method, path, payload) {
+  var apiKey = getProp_('FINCODE_API_KEY');
+  var options = {
+    method: method,
+    headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+    muteHttpExceptions: true
+  };
+  if (payload !== undefined && payload !== null) options.payload = JSON.stringify(payload);
+  var res  = UrlFetchApp.fetch(fincodeBaseUrl_() + path, options);
+  var code = res.getResponseCode();
+  var json = null;
+  try { json = JSON.parse(res.getContentText()); } catch (e) { json = null; }
+  return { code: code, json: json, ok: code >= 200 && code < 300 };
+}
+
+// fincodeのエラーレスポンスから業務エラーメッセージだけを抽出する
+// （生レスポンス全体は返さない。念のためmaskCardLike_も通す）。
+function fincodeErrorMessage_(res, fallback) {
+  if (res && res.json && res.json.errors && res.json.errors.length && res.json.errors[0].error_message) {
+    return maskCardLike_(String(res.json.errors[0].error_message));
+  }
+  return fallback + '（コード: ' + (res ? res.code : '?') + '）';
+}
+
+// customer作成（id=tenant_id）。既存ならそれを再利用する。
+function fincodeEnsureCustomer_(tenantId) {
+  var get = fincodeRequest_('get', '/v1/customers/' + encodeURIComponent(tenantId));
+  if (get.ok && get.json && get.json.id) return get.json.id;
+
+  var create = fincodeRequest_('post', '/v1/customers', { id: tenantId });
+  if (!create.ok || !create.json || !create.json.id) {
+    throw new Error(fincodeErrorMessage_(create, '顧客情報の作成に失敗しました'));
+  }
+  return create.json.id;
+}
+
+// カードトークン(フロントのfincode JS SDKがブラウザ内で生成したもの)をcustomerへ
+// 紐付ける。戻り値のcard_noはfincode側で既にマスクされたもの
+// （例: "411111******1111"）。呼び出し元で末尾4桁だけ抽出して保存すること。
+function fincodeRegisterCard_(customerId, cardToken) {
+  var res = fincodeRequest_('post', '/v1/customers/' + encodeURIComponent(customerId) + '/cards', {
+    token: cardToken,
+    default_flag: '1' // fincode APIの実際の期待形式で検証済み（'true'は「デフォルトフラグの書式が正しくありません」で拒否される）
+  });
+  if (!res.ok || !res.json || !res.json.id) {
+    throw new Error(fincodeErrorMessage_(res, 'カード登録に失敗しました'));
+  }
+  return res.json;
+}
+
+// 登録済みカードの詳細を取得する。card_no/expireの抽出は、カード作成(POST)の
+// レスポンスに頼らずこちら(GET)の結果を使う（検証の結果、GET /cards/{id} は
+// card_no（例: 16文字、前後の数字＋中間マスクの合計で16文字）・expire（"YYMM"）
+// を確実に含むことを確認したため）。
+function fincodeGetCard_(customerId, cardId) {
+  var res = fincodeRequest_('get', '/v1/customers/' + encodeURIComponent(customerId) + '/cards/' + encodeURIComponent(cardId));
+  if (!res.ok || !res.json || !res.json.id) {
+    throw new Error(fincodeErrorMessage_(res, 'カード情報の取得に失敗しました'));
+  }
+  return res.json;
+}
+
+// invoice_idを冪等キーとして決済登録→実行する。同じinvoice_idで複数回呼んでも
+// 二重決済にならない（既存paymentがあればそれを再利用し、CAPTURED済みなら
+// そのまま成功として扱う）。成功時は{id, status:'CAPTURED'}を返し、それ以外は
+// 例外をthrowする。
+function fincodeChargeInvoice_(invoiceId, customerId, cardId, amountYen) {
+  var existing = fincodeRequest_('get', '/v1/payments/' + encodeURIComponent(invoiceId));
+  var payment = (existing.ok && existing.json && existing.json.id) ? existing.json : null;
+
+  if (!payment) {
+    var create = fincodeRequest_('post', '/v1/payments', {
+      id: invoiceId,
+      pay_type: 'Card',
+      job_code: 'CAPTURE',
+      amount: String(Math.round(amountYen)),
+      customer_id: customerId,
+      card_id: cardId
+    });
+    if (!create.ok || !create.json || !create.json.id) {
+      throw new Error(fincodeErrorMessage_(create, '決済の登録に失敗しました'));
+    }
+    payment = create.json;
+  }
+
+  var status = String(payment.status || '').toUpperCase();
+  if (status !== 'CAPTURED') {
+    var exec = fincodeRequest_('put', '/v1/payments/' + encodeURIComponent(invoiceId) + '/execute', {
+      pay_type: 'Card',
+      method: '1',
+      card_id: cardId
+    });
+    if (!exec.ok || !exec.json) {
+      throw new Error(fincodeErrorMessage_(exec, '決済の実行に失敗しました'));
+    }
+    payment = exec.json;
+    status = String(payment.status || '').toUpperCase();
+  }
+
+  if (status !== 'CAPTURED') {
+    throw new Error('決済が完了しませんでした（status: ' + status + '）');
+  }
+  return { id: payment.id, status: status };
+}
+
+// カード番号のような12〜19桁の連続数字を万一含んでいた場合にマスクする多層防御
+// （fincodeのエラーメッセージ自体に生カード番号が含まれることは想定していないが、
+// ログ・メール・レスポンスに出す前に必ずこれを通す）。
+function maskCardLike_(s) {
+  return String(s || '').replace(/\d{12,19}/g, '[masked]');
+}
+
+// fincodeのexpire（"YYMM"形式、例:"3012"）を表示用の"MM/YY"に整形する。
+function formatCardExpireDisplay_(expire) {
+  var s = String(expire || '').replace(/[^0-9]/g, '');
+  if (s.length === 4) return s.slice(2, 4) + '/' + s.slice(0, 2);
+  return s;
+}
+
+// tenantsタブへfincode顧客・カード情報を保存する（フルのカード番号は保存しない。
+// card_last4は数字文字列のため先頭0が失われないようforceTextValue_を通す）。
+function saveTenantCardInfo_(tenantId, customerId, cardId, last4, expire) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet) throw new Error('tenants タブが存在しません');
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (col['fincode_customer_id'] !== undefined) sheet.getRange(r + 1, col['fincode_customer_id'] + 1).setValue(customerId);
+    if (col['fincode_card_id'] !== undefined)     sheet.getRange(r + 1, col['fincode_card_id'] + 1).setValue(cardId);
+    if (col['card_last4'] !== undefined)          sheet.getRange(r + 1, col['card_last4'] + 1).setValue(forceTextValue_(last4));
+    if (col['card_expire'] !== undefined)         sheet.getRange(r + 1, col['card_expire'] + 1).setValue(expire);
+    if (col['updated_at'] !== undefined)          sheet.getRange(r + 1, col['updated_at'] + 1).setValue(new Date());
+    return true;
+  }
+  throw new Error('tenant_id が見つかりません: ' + tenantId);
+}
+
+// action=fincodeConfig: 公開鍵・環境をフロントへ返す（秘匿情報ではない）
+function handleFincodeConfig_(body) {
+  var member = requireEntitledMember_(body);
+  var tenant = resolveTenantForMember_(member);
+  if (String(tenant.tenant_id).trim() === 'GSD') {
+    throw new Error('この機能はテナント契約のお客様のみご利用いただけます');
+  }
+  return {
+    publicKey: getProp_('FINCODE_PUBLIC_KEY'),
+    env: String(getPropOptional_('FINCODE_ENV') || 'test')
+  };
+}
+
+// action=registerCard: フロントでトークン化されたカードをtenantへ登録する
+function handleRegisterCard_(body) {
+  var member = requireEntitledMember_(body);
+  var tenant = resolveTenantForMember_(member);
+  if (String(tenant.tenant_id).trim() === 'GSD') {
+    throw new Error('この機能はテナント契約のお客様のみご利用いただけます');
+  }
+  // 注意: body.token はセッション認証用（requireEntitledMember_が検証済み）のため、
+  // fincodeのカードトークンは別フィールド名(cardToken)で受け取る。
+  var cardToken = String(body.cardToken || '').trim();
+  if (!cardToken) throw new Error('カード情報の取得に失敗しました。もう一度お試しください');
+
+  var customerId = fincodeEnsureCustomer_(tenant.tenant_id);
+  var created = fincodeRegisterCard_(customerId, cardToken);
+  // card_no/expireは作成(POST)レスポンスに頼らずGETで取り直す（検証の結果、
+  // こちらの方が確実にcard_no/expireを含むことを確認したため）。
+  var card = fincodeGetCard_(customerId, created.id);
+
+  var last4  = String(card.card_no || '').replace(/[^0-9]/g, '').slice(-4);
+  var expire = String(card.expire || '');
+  saveTenantCardInfo_(tenant.tenant_id, customerId, card.id, last4, expire);
+
+  logAudit_(member.id, 'registerCard', '-', 'ok: tenant=' + tenant.tenant_id);
+  return { registered: true, last4: last4, expire: formatCardExpireDisplay_(expire) };
+}
+
 // bootstrapAdmin: ADMIN_SECRET が未設定の場合のみ生成・保存する（二重初期化防止）
 //   値は絶対にレスポンス・ログへ出力しない。保存できた事実のみ返す。
 function handleBootstrapAdmin_(body) {
@@ -1785,16 +2002,330 @@ function recordUsageSystem_(dateKey, apiCallsDelta, mailQuotaRemaining) {
   sheet.appendRow(newRow);
 }
 
-// TODO: STEP6で実装予定（月次締め: usage集計→invoices確定・請求処理）
-// 現時点ではno-op stub（トリガー動作確認用）。
-function closeMonth_() {
-  Logger.log('[closeMonth_] STEP6未実装のため no-op');
+// ────────────────────────────────────────────────────────────────────
+// feat/fincode: 月次請求金額の計算単一情報源。
+//   light   : 基本料金0円。billable_count(=無料枠30通を除いた課金対象通数)を
+//             単価15円で課金。
+//   standard: 基本料金5,500円（込み500通）＋超過分を単価12円で課金。
+//   ※ usage.sent_count と usage.billable_count は常に同値（incrementUsage_が
+//     無料送信時はfree_usedのみ+1し、課金対象送信時のみ両方に+segmentsする
+//     ため、sent_count自体が既に「無料枠を除いた課金対象通数」になっている）。
+//     よってtrial中の無料枠30通は、ここでの計算に持ち込む前に既にusage側で
+//     除外済みである。
+//   消費税率10%、円未満の端数は切り捨て(Math.floor)とする
+//     （切り捨て/四捨五入/切り上げのいずれも許容されるが、請求額が実際の
+//     税額より大きくならない「切り捨て」を採用した。判断に迷った点として
+//     実装報告に記載）。
+//   sent_count(=billable_count)が0の場合は基本料金も含めて請求しない
+//     （total=0・status='skipped'。送信が1件も無い月にstandardの基本料金
+//     5,500円だけ請求するのは不自然なため、というのがこの判断の理由）。
+// ────────────────────────────────────────────────────────────────────
+var INVOICE_BILLING = {
+  light:    { baseFee: 0,    includedCount: 0,   overageRate: 15 },
+  standard: { baseFee: 5500, includedCount: 500, overageRate: 12 }
+};
+var INVOICE_TAX_RATE = 0.10;
+
+function calcInvoiceAmount_(plan, usage) {
+  var p = (String(plan || '').trim().toLowerCase() === 'standard') ? 'standard' : 'light';
+  var billing = INVOICE_BILLING[p];
+  var sentCount = Number(usage && usage.sent_count) || 0;
+
+  if (sentCount === 0) {
+    return {
+      plan: p, sent_count: 0, included: billing.includedCount, overage_count: 0,
+      base_fee: 0, overage_fee: 0, subtotal: 0, tax: 0, total: 0, status: 'skipped'
+    };
+  }
+
+  var overageCount = Math.max(0, sentCount - billing.includedCount);
+  var baseFee    = billing.baseFee;
+  var overageFee = overageCount * billing.overageRate;
+  var subtotal   = baseFee + overageFee;
+  var tax        = Math.floor(subtotal * INVOICE_TAX_RATE);
+  var total      = subtotal + tax;
+
+  return {
+    plan: p, sent_count: sentCount, included: billing.includedCount, overage_count: overageCount,
+    base_fee: baseFee, overage_fee: overageFee, subtotal: subtotal, tax: tax, total: total,
+    status: null // これから決済処理を行う（呼び出し元がpaid/unpaid/failedを確定する）
+  };
 }
 
-// TODO: STEP3で実装予定（trial_end超過等のテナントstatus日次遷移チェック）
-// 現時点ではno-op stub（トリガー動作確認用）。
+// calc(calcInvoiceAmount_の戻り値)にyearMonthを添えた「メール・invoices更新共通で
+// 使う請求内訳オブジェクト」を作る。
+function calcToCalcLike_(calc, yearMonth) {
+  return {
+    plan: calc.plan, yearMonth: yearMonth, sent_count: calc.sent_count, included: calc.included,
+    overage_count: calc.overage_count, base_fee: calc.base_fee, overage_fee: calc.overage_fee,
+    subtotal: calc.subtotal, tax: calc.tax, total: calc.total
+  };
+}
+
+// invoices行（生のセル配列）から同じ形の請求内訳オブジェクトを作る（再試行用）。
+function buildCalcLikeFromInvoiceRow_(rowArray, col, yearMonth) {
+  return {
+    plan: String(rowArray[col['plan']] || ''), yearMonth: yearMonth,
+    sent_count: Number(rowArray[col['sent_count']]) || 0,
+    included: Number(rowArray[col['included']]) || 0,
+    overage_count: Number(rowArray[col['overage_count']]) || 0,
+    base_fee: Number(rowArray[col['base_fee']]) || 0,
+    overage_fee: Number(rowArray[col['overage_fee']]) || 0,
+    subtotal: Number(rowArray[col['subtotal']]) || 0,
+    tax: Number(rowArray[col['tax']]) || 0,
+    total: Number(rowArray[col['total']]) || 0
+  };
+}
+
+// 指定日付の「前月」をyyyyMM形式で返す（closeMonth_は毎月1日に実行される前提。
+// 日=1同士の月演算のためJSのDate月ロールオーバーの問題は起きない）。
+function prevYearMonth_(baseDate) {
+  var d = baseDate ? new Date(baseDate) : new Date();
+  d.setMonth(d.getMonth() - 1);
+  return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyyMM');
+}
+
+// tenants タブの全行をオブジェクト配列で返す（handleListTenants_と同じ形だが
+// requireAdmin_を経由しない内部専用ヘルパー。closeMonth_から呼ぶ）。
+function listAllTenants_() {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var out = [];
+  for (var r = 1; r < data.length; r++) {
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+    out.push(obj);
+  }
+  return out;
+}
+
+// invoicesタブから該当tenant_id・年月の行を1件探す（無ければnull）。
+function findInvoiceByTenantAndMonth_(tenantId, yearMonth) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('invoices');
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (String(data[r][col['年月']]).trim() !== String(yearMonth).trim()) continue;
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+    return obj;
+  }
+  return null;
+}
+
+// invoicesタブへ1行追加する。戻り値でsheet/col/sheetRowを返し、呼び出し元が
+// 追加直後にattemptInvoicePayment_で同じ行を更新できるようにする。
+function appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, status) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('invoices');
+  if (!sheet) throw new Error('invoices タブが存在しません');
+  var lastCol = sheet.getLastColumn();
+  var hdr = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+
+  var row = hdr.map(function(h) {
+    if (h === 'invoice_id')       return invoiceId;
+    if (h === 'tenant_id')        return tenantId;
+    if (h === '年月')             return yearMonth;
+    if (h === 'plan')             return calc.plan;
+    if (h === 'sent_count')       return calc.sent_count;
+    if (h === 'included')         return calc.included;
+    if (h === 'overage_count')    return calc.overage_count;
+    if (h === 'base_fee')         return calc.base_fee;
+    if (h === 'overage_fee')      return calc.overage_fee;
+    if (h === 'subtotal')         return calc.subtotal;
+    if (h === 'tax')              return calc.tax;
+    if (h === 'total')            return calc.total;
+    if (h === 'fincode_order_id') return invoiceId;
+    if (h === 'status')           return status;
+    if (h === 'retry_count')      return 0;
+    return '';
+  });
+  sheet.appendRow(row);
+
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  return { sheet: sheet, col: col, sheetRow: sheet.getLastRow(), hdr: hdr };
+}
+
+// 1件のinvoice行に対して実際の決済を試みる共通処理（closeMonth_の初回実行・
+// dailyResetCheck_の再試行・管理画面の手動「再実行」の3経路から共通で呼ばれる）。
+//   成功 → status='paid'・charged_at設定・retry_atクリア・請求明細メール送信。
+//   失敗 → retry_count+1。2に達したらtenants.statusを'suspended'に変更し、
+//     以後の自動再試行は行わない（suspended通知メール）。2未満ならretry_atを
+//     3日後に設定し、担当者・管理者へ失敗通知メールを送る。
+function attemptInvoicePayment_(sheet, col, sheetRow, invoiceId, calcLike, tenant, currentRetryCount) {
+  try {
+    fincodeChargeInvoice_(invoiceId, tenant.fincode_customer_id, tenant.fincode_card_id, calcLike.total);
+    sheet.getRange(sheetRow, col['status'] + 1).setValue('paid');
+    sheet.getRange(sheetRow, col['charged_at'] + 1).setValue(new Date());
+    sheet.getRange(sheetRow, col['retry_at'] + 1).setValue('');
+    sendInvoicePaidEmail_(tenant, calcLike);
+    return { status: 'paid' };
+  } catch (e) {
+    var newRetryCount = currentRetryCount + 1;
+    var safeMsg = maskCardLike_(e.message);
+    sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
+    sheet.getRange(sheetRow, col['retry_count'] + 1).setValue(newRetryCount);
+
+    if (newRetryCount >= 2) {
+      setTenantStatus_(tenant.tenant_id, 'suspended');
+      sheet.getRange(sheetRow, col['retry_at'] + 1).setValue('');
+      notifySuspended_(tenant, calcLike, safeMsg);
+      return { status: 'failed', suspended: true, error: safeMsg };
+    }
+    var nextRetryAt = new Date();
+    nextRetryAt.setDate(nextRetryAt.getDate() + 3);
+    sheet.getRange(sheetRow, col['retry_at'] + 1).setValue(nextRetryAt);
+    notifyPaymentFailed_(tenant, calcLike, safeMsg, newRetryCount);
+    return { status: 'failed', suspended: false, error: safeMsg };
+  }
+}
+
+// closeMonth_/closeMonthRun/closeMonthDryRunの共通本体。
+//   dryRun=trueの場合は計算のみ行い、invoices行の作成・決済・メール送信は
+//   一切行わない（金額試算の確認用）。
+//   同一tenant_id・年月のinvoiceが既に存在する場合は重複作成しない
+//   （closeMonth_の再実行・closeMonthRunの手動再実行に対する冪等性。
+//   failed分の再試行はdailyResetCheck_/管理画面の「再実行」ボタンの役割とする）。
+function runCloseMonthForYearMonth_(yearMonth, opts) {
+  opts = opts || {};
+  var dryRun = !!opts.dryRun;
+  var tenants = listAllTenants_();
+  var stats = {
+    yearMonth: yearMonth, dryRun: dryRun, processed: 0,
+    paid: 0, unpaid: 0, failed: 0, skipped: 0, suspended: 0, invoices: []
+  };
+
+  tenants.forEach(function(tenant) {
+    var tenantId = String(tenant.tenant_id || '').trim();
+    if (!tenantId || tenantId === 'GSD') return; // GSDは商用課金対象外（既存運用への影響回避）
+
+    stats.processed++;
+    var usage    = getUsageRow_(tenantId, yearMonth) || { sent_count: 0, free_used: 0, billable_count: 0 };
+    var calc     = calcInvoiceAmount_(tenant.plan, usage);
+    var calcLike = calcToCalcLike_(calc, yearMonth);
+
+    if (dryRun) {
+      var expected = calc.status === 'skipped' ? 'skipped' : (tenant.fincode_card_id ? '決済実行対象' : 'unpaid');
+      stats.invoices.push({
+        tenant_id: tenantId, plan: calc.plan, sent_count: calc.sent_count,
+        total: calc.total, expected_status: expected
+      });
+      if (calc.status === 'skipped') stats.skipped++;
+      return;
+    }
+
+    var existing = findInvoiceByTenantAndMonth_(tenantId, yearMonth);
+    if (existing) {
+      stats.invoices.push({ tenant_id: tenantId, invoice_id: existing.invoice_id, status: existing.status, note: 'already_exists' });
+      return;
+    }
+
+    if (calc.status === 'skipped') {
+      var invoiceIdSkip = Utilities.getUuid();
+      appendInvoiceRow_(invoiceIdSkip, tenantId, yearMonth, calc, 'skipped');
+      stats.skipped++;
+      stats.invoices.push({ tenant_id: tenantId, invoice_id: invoiceIdSkip, status: 'skipped' });
+      return;
+    }
+
+    var invoiceId = Utilities.getUuid();
+    if (!tenant.fincode_card_id) {
+      appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, 'unpaid');
+      sendCardRegistrationRequestEmail_(tenant);
+      stats.unpaid++;
+      stats.invoices.push({ tenant_id: tenantId, invoice_id: invoiceId, status: 'unpaid' });
+      return;
+    }
+
+    var appended = appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, 'processing');
+    var outcome  = attemptInvoicePayment_(appended.sheet, appended.col, appended.sheetRow, invoiceId, calcLike, tenant, 0);
+    if (outcome.status === 'paid') stats.paid++;
+    else { stats.failed++; if (outcome.suspended) stats.suspended++; }
+    stats.invoices.push({ tenant_id: tenantId, invoice_id: invoiceId, status: outcome.status });
+  });
+
+  return stats;
+}
+
+// closeMonth_: 月次締め処理（毎月1日02:00 JSTのトリガーから呼ばれる）。前月分の
+// usageを元に請求額を計算し、invoices行を確定、fincode決済を実行する。
+function closeMonth_() {
+  var yearMonth = prevYearMonth_();
+  var result = runCloseMonthForYearMonth_(yearMonth, { dryRun: false });
+  Logger.log('[closeMonth_] yearMonth=' + yearMonth
+    + ' processed=' + result.processed + ' paid=' + result.paid + ' unpaid=' + result.unpaid
+    + ' failed=' + result.failed + ' skipped=' + result.skipped + ' suspended=' + result.suspended);
+  return result;
+}
+
+// invoicesのstatus='failed'かつretry_atが到来した行を拾って再決済を試みる
+// （dailyResetCheck_から呼ばれる）。カードが未登録のままの場合は再試行せず
+// retry_atだけ3日先へずらす（無駄なAPI呼び出しを避けるため）。
+function retryFailedInvoices_() {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('invoices');
+  var stats = { processed: 0, paid: 0, failed: 0, suspended: 0 };
+  if (!sheet || sheet.getLastRow() < 2) return stats;
+
+  var lastCol = sheet.getLastColumn();
+  var hdr = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastCol).getValues();
+  var now = new Date();
+
+  for (var r = 0; r < data.length; r++) {
+    var status = String(data[r][col['status']] || '').trim();
+    if (status !== 'failed') continue;
+    var retryAtRaw = data[r][col['retry_at']];
+    if (!retryAtRaw) continue;
+    var retryAt = new Date(retryAtRaw);
+    if (isNaN(retryAt.getTime()) || retryAt > now) continue;
+
+    var sheetRow   = r + 2;
+    var invoiceId  = String(data[r][col['invoice_id']] || '');
+    var tenantId   = String(data[r][col['tenant_id']] || '');
+    var yearMonth  = String(data[r][col['年月']] || '');
+    var retryCount = Number(data[r][col['retry_count']]) || 0;
+    var tenant     = getTenantById_(tenantId);
+
+    stats.processed++;
+
+    if (!tenant || !tenant.fincode_card_id) {
+      var nextRetryAtNoCard = new Date();
+      nextRetryAtNoCard.setDate(nextRetryAtNoCard.getDate() + 3);
+      sheet.getRange(sheetRow, col['retry_at'] + 1).setValue(nextRetryAtNoCard);
+      stats.failed++;
+      continue;
+    }
+
+    var calcLike = buildCalcLikeFromInvoiceRow_(data[r], col, yearMonth);
+    var outcome  = attemptInvoicePayment_(sheet, col, sheetRow, invoiceId, calcLike, tenant, retryCount);
+    if (outcome.status === 'paid') stats.paid++;
+    else { stats.failed++; if (outcome.suspended) stats.suspended++; }
+  }
+  return stats;
+}
+
+// dailyResetCheck_: 毎日00:05 JSTのトリガーから呼ばれる。
+//   trial_end超過等のテナントstatus遷移は、実際には送信時に都度
+//   transitionTrialIfNeeded_（checkSendAllowed_内）で判定される設計のため、
+//   ここでの重複実装は行わない。feat/fincodeで、失敗した決済のretry_at到来分を
+//   拾い上げて再試行する役割を初めて実装した。
 function dailyResetCheck_() {
-  Logger.log('[dailyResetCheck_] STEP3未実装のため no-op');
+  var result = retryFailedInvoices_();
+  Logger.log('[dailyResetCheck_] retry: processed=' + result.processed + ' paid=' + result.paid
+    + ' failed=' + result.failed + ' suspended=' + result.suspended);
+  return result;
 }
 
 // addendum G: ログアーカイブ（月次トリガーから呼ばれる想定）。
@@ -2085,6 +2616,110 @@ function handleIssueAccount_(body) {
   return { id: id, tenant_id: tenantId, email: email };
 }
 
+// action=closeMonthDryRun: 指定年月の請求額を計算のみ行う（決済・メール送信は行わない）
+function handleCloseMonthDryRun_(body) {
+  requireAdmin_(body);
+  var yearMonth = String(body.year_month || '').trim();
+  if (!/^\d{6}$/.test(yearMonth)) throw new Error('year_month はyyyyMM形式で指定してください（例: 202609）');
+  return runCloseMonthForYearMonth_(yearMonth, { dryRun: true });
+}
+
+// action=closeMonthRun: 指定年月についてcloseMonth_と同じ請求・決済処理を手動実行する
+function handleCloseMonthRun_(body) {
+  requireAdmin_(body);
+  var yearMonth = String(body.year_month || '').trim();
+  if (!/^\d{6}$/.test(yearMonth)) throw new Error('year_month はyyyyMM形式で指定してください（例: 202609）');
+  return runCloseMonthForYearMonth_(yearMonth, { dryRun: false });
+}
+
+// action=listInvoices: invoicesタブの全行を返す（管理画面の請求一覧表示用）
+function handleListInvoices_(body) {
+  requireAdmin_(body);
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('invoices');
+  if (!sheet || sheet.getLastRow() < 2) return { invoices: [] };
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var out = [];
+  for (var r = 1; r < data.length; r++) {
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+    out.push(obj);
+  }
+  return { invoices: out };
+}
+
+// action=retryInvoice: 管理画面の「再実行」ボタン用。指定invoice_id 1件のみ
+// 決済を再試行する（failed/unpaidいずれの状態からでも呼べる）。
+//   attemptInvoicePayment_と同じ状態遷移（成功→paid、失敗→retry_count+1、
+//   2回連続失敗→tenants.statusをsuspended）を経由する。
+function handleRetryInvoice_(body) {
+  requireAdmin_(body);
+  var invoiceId = String(body.invoice_id || '').trim();
+  if (!invoiceId) throw new Error('invoice_id は必須です');
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('invoices');
+  if (!sheet) throw new Error('invoices タブが存在しません');
+  var lastCol = sheet.getLastColumn();
+  var hdr = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  var data = sheet.getDataRange().getValues();
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['invoice_id']]).trim() !== invoiceId) continue;
+    var sheetRow   = r + 1;
+    var tenantId   = String(data[r][col['tenant_id']] || '');
+    var yearMonth  = String(data[r][col['年月']] || '');
+    var retryCount = Number(data[r][col['retry_count']]) || 0;
+
+    var tenant = getTenantById_(tenantId);
+    if (!tenant) throw new Error('テナントが見つかりません: ' + tenantId);
+    if (!tenant.fincode_card_id) throw new Error('カードが未登録のため決済できません（先にカード登録が必要です）');
+
+    var calcLike = buildCalcLikeFromInvoiceRow_(data[r], col, yearMonth);
+    var outcome  = attemptInvoicePayment_(sheet, col, sheetRow, invoiceId, calcLike, tenant, retryCount);
+    return { invoice_id: invoiceId, status: outcome.status, suspended: !!outcome.suspended };
+  }
+  throw new Error('invoice_id が見つかりません: ' + invoiceId);
+}
+
+// テスト用単体テスト関数: calcInvoiceAmount_が期待通りの請求額を計算するか確認する。
+//   実行方法: Apps Scriptエディタから直接実行、またはdoPost経由の専用actionから呼ぶ。
+//   4パターン:
+//   - light・0通(送信無し)        → 0円・status=skipped
+//   - light・200通                → 無料枠30通を除いた課金対象170通 × 15円
+//                                    = 2,550円 + 税255円 = 2,805円
+//     （free_used=30・billable_count=170を想定。無料枠はusage側で既に
+//     除外済みのため、ここでは billable_count=170 を直接与える）
+//   - standard・400通             → 無料枠30通を除いた課金対象370通（込み500通以内
+//                                    のため超過分無し）→ 基本料金5,500円のみ
+//                                    + 税550円 = 6,050円
+//   - standard・700通             → 無料枠30通を除いた課金対象670通（込み500通を
+//                                    170通超過）→ 5,500円 + 170×12円=2,040円
+//                                    = 7,540円 + 税754円 = 8,294円
+function testInvoiceCalc_() {
+  var cases = [
+    { label: 'light_0通',      plan: 'light',    usage: { sent_count: 0 },   expectedTotal: 0,    expectedStatus: 'skipped' },
+    { label: 'light_200通(無料枠30通控除後170通)', plan: 'light',    usage: { sent_count: 170 }, expectedTotal: 2805, expectedStatus: null },
+    { label: 'standard_400通(無料枠30通控除後370通)', plan: 'standard', usage: { sent_count: 370 }, expectedTotal: 6050, expectedStatus: null },
+    { label: 'standard_700通(無料枠30通控除後670通)', plan: 'standard', usage: { sent_count: 670 }, expectedTotal: 8294, expectedStatus: null }
+  ];
+
+  var results = cases.map(function(c) {
+    var r = calcInvoiceAmount_(c.plan, c.usage);
+    var pass = r.total === c.expectedTotal && (r.status || null) === (c.expectedStatus || null);
+    return {
+      label: c.label, expectedTotal: c.expectedTotal, actualTotal: r.total,
+      expectedStatus: c.expectedStatus, actualStatus: r.status, pass: pass
+    };
+  });
+  var allPass = results.every(function(r) { return r.pass; });
+  Logger.log('[testInvoiceCalc_] allPass=' + allPass + ' ' + JSON.stringify(results));
+  return { allPass: allPass, results: results };
+}
+
 // handleIssueAccount_専用: tenants.statusが'pending_number'の場合のみ'trial'へ
 // 自動遷移させる（trial_endは申込月末のまま変更しない）。それ以外のstatus
 // （trial/active/suspended等）は変更しない。
@@ -2150,6 +2785,11 @@ function sendInitialPasswordEmail_(email, id, plainPw) {
     '初期パスワード: ' + plainPw,
     '',
     '初回ログイン後、お早めにパスワードの変更をご検討ください。',
+    '',
+    // feat/fincode: お支払い方法（カード）登録ページへの案内リンクを追記
+    'お支払い方法（クレジットカード）のご登録は、ログイン後に下記ページから行えます。',
+    CARD_PAGE_URL,
+    '',
     '心当たりのない場合はこのメールを無視してください。'
   ].join('\n');
 
@@ -2161,6 +2801,134 @@ function sendInitialPasswordEmail_(email, id, plainPw) {
   }
   // 平文パスワードはメール本文のみ。ログ・レスポンスには一切出さない。
   MailApp.sendEmail({ to: email, subject: subject, body: body });
+}
+
+// checkMailQuota_/enqueueMailForRetry_の定型パターンを共通化した送信ヘルパー
+// （feat/fincodeの新規メール群から使用。既存の各send*Email_関数は変更せず
+// そのままの実装を踏襲している）。
+function sendMailWithQuotaGuard_(to, subject, body, logLabel) {
+  if (checkMailQuota_()) {
+    Logger.log('[' + (logLabel || 'mail') + '] メール送信不可(クォータ残少)のためmail_queueに積みました。'
+      + '翌日以降に自動再送されます。 to=' + to);
+    enqueueMailForRetry_(to, subject, body);
+    return;
+  }
+  MailApp.sendEmail({ to: to, subject: subject, body: body });
+}
+
+// feat/fincode: お支払い方法（カード）未登録のテナント担当者へ登録依頼メールを送る
+function sendCardRegistrationRequestEmail_(tenant) {
+  var email = String(tenant['担当者メール'] || '').trim();
+  if (!email) return;
+  var subject = '【SMS送信侍】お支払い方法（カード）登録のお願い';
+  var body = [
+    (tenant['担当者名'] || tenant['会社名'] || 'ご担当者') + ' 様',
+    '',
+    'いつもSMS送信侍をご利用いただきありがとうございます。',
+    '今月分のご請求にあたり、お支払い方法（クレジットカード）が未登録のため決済処理ができませんでした。',
+    '',
+    '下記リンクよりカード登録をお願いいたします。',
+    CARD_PAGE_URL,
+    '',
+    'ご登録が完了次第、あらためて決済処理を行います。',
+    'ご不明な点がございましたら本メールにご返信ください。'
+  ].join('\n');
+  sendMailWithQuotaGuard_(email, subject, body, 'sendCardRegistrationRequestEmail_');
+}
+
+// feat/fincode: 決済成功後、担当者へ請求明細メールを送る（カード番号は一切出さず、
+// 末尾4桁(tenants.card_last4)のみ記載する）
+function sendInvoicePaidEmail_(tenant, calcLike) {
+  var email = String(tenant['担当者メール'] || '').trim();
+  if (!email) return;
+  var planLabel = calcLike.plan === 'standard' ? 'standard（スタンダード）' : 'light（ライト）';
+  var last4 = String(tenant['card_last4'] || '').trim();
+  var subject = '【SMS送信侍】ご請求明細（' + calcLike.yearMonth + '分）';
+  var lines = [
+    (tenant['担当者名'] || tenant['会社名'] || 'ご担当者') + ' 様',
+    '',
+    'いつもSMS送信侍をご利用いただきありがとうございます。',
+    '以下の内容でお支払いが完了しましたのでご連絡いたします。',
+    '',
+    '対象年月: ' + calcLike.yearMonth,
+    'プラン: ' + planLabel,
+    '送信数: ' + calcLike.sent_count + '通（うち込み ' + calcLike.included + '通・超過 ' + calcLike.overage_count + '通）',
+    '基本料金: ' + calcLike.base_fee.toLocaleString() + '円',
+    '超過分料金: ' + calcLike.overage_fee.toLocaleString() + '円',
+    '消費税: ' + calcLike.tax.toLocaleString() + '円',
+    'ご請求額（税込）: ' + calcLike.total.toLocaleString() + '円'
+  ];
+  if (last4) lines.push('お支払いカード: 下4桁 ' + last4);
+  lines.push('', 'ご不明な点がございましたら本メールにご返信ください。');
+  sendMailWithQuotaGuard_(email, subject, lines.join('\n'), 'sendInvoicePaidEmail_');
+}
+
+// feat/fincode: 決済失敗時、担当者・管理者へ通知する（3日後に自動再試行する旨を案内）
+function notifyPaymentFailed_(tenant, calcLike, errorMessage, retryCount) {
+  var contactEmail = String(tenant['担当者メール'] || '').trim();
+  var adminEmail   = getPropOptional_('ADMIN_NOTIFY_EMAIL') || 'tokyoflowerco.ltd@gmail.com';
+  var subject = '【SMS送信侍】決済に失敗しました（' + calcLike.yearMonth + '分）';
+
+  if (contactEmail) {
+    var body = [
+      (tenant['担当者名'] || tenant['会社名'] || 'ご担当者') + ' 様',
+      '',
+      'いつもSMS送信侍をご利用いただきありがとうございます。',
+      '今月分（' + calcLike.yearMonth + '）のご請求について、ご登録のカードでの決済に失敗いたしました。',
+      '',
+      'ご請求額（税込）: ' + calcLike.total.toLocaleString() + '円',
+      '',
+      'カード情報のご確認、または別のカードへの変更を下記よりお願いいたします。',
+      CARD_PAGE_URL,
+      '',
+      '3日後に自動的に再試行いたします。複数回失敗した場合、誠に恐れ入りますが送信機能を一時停止させていただく場合がございます。',
+      'ご不明な点がございましたら本メールにご返信ください。'
+    ].join('\n');
+    sendMailWithQuotaGuard_(contactEmail, subject, body, 'notifyPaymentFailed_contact');
+  }
+
+  var adminBody = [
+    'テナントの決済に失敗しました（' + retryCount + '回目）。',
+    '',
+    'tenant_id: ' + tenant.tenant_id,
+    '会社名: ' + (tenant['会社名'] || ''),
+    'ご請求額（税込）: ' + calcLike.total.toLocaleString() + '円',
+    'エラー: ' + errorMessage
+  ].join('\n');
+  sendMailWithQuotaGuard_(adminEmail, subject, adminBody, 'notifyPaymentFailed_admin');
+}
+
+// feat/fincode: 2回連続決済失敗によりtenants.statusをsuspendedへ変更した際、
+// 担当者・管理者へ通知する
+function notifySuspended_(tenant, calcLike, errorMessage) {
+  var contactEmail = String(tenant['担当者メール'] || '').trim();
+  var adminEmail   = getPropOptional_('ADMIN_NOTIFY_EMAIL') || 'tokyoflowerco.ltd@gmail.com';
+  var subject = '【SMS送信侍】お支払いの失敗によりサービスを停止しました';
+
+  if (contactEmail) {
+    var body = [
+      (tenant['担当者名'] || tenant['会社名'] || 'ご担当者') + ' 様',
+      '',
+      'ご請求額（税込） ' + calcLike.total.toLocaleString() + '円 のお支払いが2回連続で失敗したため、',
+      '誠に恐れ入りますがSMS送信機能を停止させていただきました。',
+      '',
+      'カード情報のご確認・変更後、担当者までご連絡いただければ再開いたします。',
+      CARD_PAGE_URL,
+      '',
+      'ご不明な点がございましたら本メールにご返信ください。'
+    ].join('\n');
+    sendMailWithQuotaGuard_(contactEmail, subject, body, 'notifySuspended_contact');
+  }
+
+  var adminBody = [
+    'テナントの決済が2回連続で失敗したため、自動的にsuspendedへ変更しました。',
+    '',
+    'tenant_id: ' + tenant.tenant_id,
+    '会社名: ' + (tenant['会社名'] || ''),
+    'ご請求額（税込）: ' + calcLike.total.toLocaleString() + '円',
+    'エラー: ' + errorMessage
+  ].join('\n');
+  sendMailWithQuotaGuard_(adminEmail, subject, adminBody, 'notifySuspended_admin');
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2756,7 +3524,12 @@ function handleMyTenantStatus_(body) {
     todaySent:   countTodaySent_(tenant.tenant_id),
     senderNumberNotice: senderNumberNotice,
     // 登録済み送信元番号（無ければnull＝フォールバック中）。ハイフン等の整形はフロント側で行う。
-    registeredSenderNumber: registeredSender ? String(registeredSender['電話番号'] || '') : null
+    registeredSenderNumber: registeredSender ? String(registeredSender['電話番号'] || '') : null,
+    // feat/fincode: お支払い方法（カード）の登録状況。カード番号本体は一切返さない
+    // （末尾4桁・有効期限のみ。fincode_customer_id/fincode_card_id自体も返さない）。
+    hasCard:      isGsd ? null : !!(tenant.fincode_card_id),
+    cardLast4:    isGsd ? null : (String(tenant['card_last4'] || '').trim() || null),
+    cardExpire:   isGsd ? null : (tenant['card_expire'] ? formatCardExpireDisplay_(tenant['card_expire']) : null)
   };
 }
 

@@ -139,7 +139,7 @@
           <thead>
             <tr>
               <th>会社名</th><th>tenant_id</th><th>プラン</th><th>ステータス</th>
-              <th>申込日</th><th>trial_end</th><th>操作</th>
+              <th>申込日</th><th>trial_end</th><th>カード</th><th>操作</th>
             </tr>
           </thead>
           <tbody id="tenants-tbody"></tbody>
@@ -199,6 +199,51 @@
       </div>
     </div>
 
+    <!-- 月次請求（feat/fincode） -->
+    <div class="card">
+      <h2>月次請求</h2>
+      <div class="row">
+        <div class="field">
+          <div class="eyebrow">対象年月（yyyyMM）</div>
+          <input type="text" id="cm-year-month" class="input" placeholder="例: 202609">
+        </div>
+        <div class="field">
+          <button type="button" class="btn-ghost" id="cm-dryrun-btn">試算（決済・メール送信なし）</button>
+        </div>
+        <div class="field">
+          <button type="button" class="btn" id="cm-run-btn">実行（決済・メール送信あり）</button>
+        </div>
+      </div>
+      <div class="hint">試算は計算のみ行い、実際の請求・決済・メール送信は一切行いません。</div>
+      <div id="cm-result" class="hidden" style="margin-top:var(--s3)">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>tenant_id</th><th>プラン</th><th>送信数</th><th>金額</th><th>状態</th></tr></thead>
+            <tbody id="cm-result-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 請求一覧（feat/fincode） -->
+    <div class="card">
+      <h2>請求一覧</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>年月</th><th>tenant_id</th><th>プラン</th><th>金額（税込）</th>
+              <th>status</th><th>retry_count</th><th>retry_at</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="invoices-tbody"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:var(--s3)">
+        <button type="button" class="btn-ghost btn-small" id="reload-invoices-btn">再読み込み</button>
+      </div>
+    </div>
+
     <!-- アカウント発行 -->
     <div class="card">
       <h2>アカウント発行</h2>
@@ -248,6 +293,9 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('reload-tenants-btn').addEventListener('click', loadTenants);
   document.getElementById('pc-submit-btn').addEventListener('click', handlePlanChangeSubmit);
   document.getElementById('ia-submit-btn').addEventListener('click', handleIssueAccountSubmit);
+  document.getElementById('cm-dryrun-btn').addEventListener('click', () => handleCloseMonth(true));
+  document.getElementById('cm-run-btn').addEventListener('click', () => handleCloseMonth(false));
+  document.getElementById('reload-invoices-btn').addEventListener('click', loadInvoices);
 });
 
 // ── ログイン ─────────────────────────────────────────────────────
@@ -267,6 +315,7 @@ async function handleLogin() {
     document.getElementById('login-view').classList.add('hidden');
     document.getElementById('admin-view').classList.remove('hidden');
     renderTenants(data.result.tenants || []);
+    loadInvoices();
   } catch (err) {
     showSpinner(false);
     showLoginError('通信エラー: ' + err.message);
@@ -300,7 +349,7 @@ function renderTenants(tenants) {
   tenantsCache = tenants;
   const tbody = document.getElementById('tenants-tbody');
   if (!tenants.length) {
-    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">テナントがありません</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--muted)">テナントがありません</td></tr>';
     return;
   }
   tbody.innerHTML = tenants.map(t => {
@@ -308,6 +357,11 @@ function renderTenants(tenants) {
     const badgeClass = status === 'active' ? 'active' : (status === 'trial' ? 'trial' : (status === 'pending_number' ? 'pending' : 'other'));
     const trialEnd = formatDateCell(t['trial_end']);
     const appliedAt = formatDateCell(t['申込日']);
+    // feat/fincode: カード登録状況（fincode_card_idの有無のみで判定。カード番号は扱わない）
+    const hasCard = !!String(t['fincode_card_id'] || '').trim();
+    const cardBadge = hasCard
+      ? `<span class="badge registered">登録済み${t['card_last4'] ? '（下4桁 ' + escHtml(String(t['card_last4'])) + '）' : ''}</span>`
+      : '<span class="badge other">未登録</span>';
     return `<tr data-tenant-id="${escHtml(t['tenant_id'] || '')}">
       <td>${escHtml(t['会社名'] || '')}</td>
       <td style="font-family:var(--font-mono)">${escHtml(t['tenant_id'] || '')}</td>
@@ -315,6 +369,7 @@ function renderTenants(tenants) {
       <td><span class="badge ${badgeClass}">${escHtml(status)}</span></td>
       <td>${escHtml(appliedAt)}</td>
       <td>${escHtml(trialEnd)}</td>
+      <td>${cardBadge}</td>
       <td><button type="button" class="btn-ghost btn-small select-tenant-btn">選択</button></td>
     </tr>`;
   }).join('');
@@ -464,6 +519,109 @@ async function handleIssueAccountSubmit() {
     document.getElementById('ia-id').value = '';
     document.getElementById('ia-email').value = '';
     document.getElementById('ia-contact-name').value = '';
+  } catch (err) {
+    showSpinner(false);
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+// ── 月次請求（feat/fincode） ──────────────────────────────────────
+async function handleCloseMonth(dryRun) {
+  const yearMonth = document.getElementById('cm-year-month').value.trim();
+  if (!/^\d{6}$/.test(yearMonth)) { showGlobalMsg('対象年月はyyyyMM形式で入力してください（例: 202609）', 'error'); return; }
+  if (!dryRun && !window.confirm(`${yearMonth}分の請求・決済処理を実行します。よろしいですか？（メール送信・実際の決済が行われます）`)) return;
+
+  showSpinner(true);
+  try {
+    const action = dryRun ? 'closeMonthDryRun' : 'closeMonthRun';
+    const data = await callApi(action, { year_month: yearMonth });
+    showSpinner(false);
+    if (!data.ok) { showGlobalMsg(data.error || '月次請求処理に失敗しました', 'error'); return; }
+    renderCloseMonthResult(data.result, dryRun);
+    showGlobalMsg(
+      (dryRun ? '試算が完了しました' : '請求処理が完了しました')
+      + `（対象${data.result.processed}件 / paid:${data.result.paid} unpaid:${data.result.unpaid} failed:${data.result.failed} skipped:${data.result.skipped}）`,
+      'success'
+    );
+    if (!dryRun) loadInvoices();
+  } catch (err) {
+    showSpinner(false);
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+function renderCloseMonthResult(result, dryRun) {
+  const wrap = document.getElementById('cm-result');
+  const tbody = document.getElementById('cm-result-tbody');
+  const rows = result.invoices || [];
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">対象テナントがありません</td></tr>';
+  } else {
+    tbody.innerHTML = rows.map(r => `<tr>
+      <td style="font-family:var(--font-mono)">${escHtml(r.tenant_id || '')}</td>
+      <td>${escHtml(r.plan || '')}</td>
+      <td>${escHtml(String(r.sent_count != null ? r.sent_count : ''))}</td>
+      <td>${r.total != null ? escHtml(String(r.total)) + '円' : ''}</td>
+      <td>${escHtml(r.status || r.expected_status || (r.note || ''))}</td>
+    </tr>`).join('');
+  }
+  wrap.classList.remove('hidden');
+}
+
+// ── 請求一覧（feat/fincode） ──────────────────────────────────────
+async function loadInvoices() {
+  try {
+    const data = await callApi('listInvoices', {});
+    if (!data.ok) { showGlobalMsg(data.error || '請求一覧の取得に失敗しました', 'error'); return; }
+    renderInvoices(data.result.invoices || []);
+  } catch (err) {
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+function renderInvoices(invoices) {
+  const tbody = document.getElementById('invoices-tbody');
+  if (!invoices.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="color:var(--muted)">請求データがありません</td></tr>';
+    return;
+  }
+  // 年月の新しい順に並べる
+  const sorted = invoices.slice().sort((a, b) => String(b['年月'] || '').localeCompare(String(a['年月'] || '')));
+  tbody.innerHTML = sorted.map(inv => {
+    const status = String(inv['status'] || '');
+    const badgeClass = status === 'paid' ? 'active' : (status === 'skipped' ? 'trial' : (status === 'unpaid' ? 'pending' : 'other'));
+    const canRetry = status === 'failed' || status === 'unpaid';
+    const retryBtn = canRetry
+      ? `<button type="button" class="btn btn-small retry-invoice-btn" data-invoice-id="${escHtml(inv['invoice_id'] || '')}">再実行</button>`
+      : '';
+    return `<tr>
+      <td>${escHtml(inv['年月'] || '')}</td>
+      <td style="font-family:var(--font-mono)">${escHtml(inv['tenant_id'] || '')}</td>
+      <td>${escHtml(inv['plan'] || '')}</td>
+      <td>${escHtml(String(inv['total'] != null ? inv['total'] : ''))}円</td>
+      <td><span class="badge ${badgeClass}">${escHtml(status)}</span></td>
+      <td>${escHtml(String(inv['retry_count'] != null ? inv['retry_count'] : ''))}</td>
+      <td>${escHtml(formatDateCell(inv['retry_at']))}</td>
+      <td>${retryBtn}</td>
+    </tr>`;
+  }).join('');
+
+  tbody.querySelectorAll('.retry-invoice-btn').forEach(btn => {
+    btn.addEventListener('click', () => handleRetryInvoice(btn.dataset.invoiceId));
+  });
+}
+
+async function handleRetryInvoice(invoiceId) {
+  if (!invoiceId) return;
+  if (!window.confirm('この請求を再実行（決済を再試行）します。よろしいですか？')) return;
+  showSpinner(true);
+  try {
+    const data = await callApi('retryInvoice', { invoice_id: invoiceId });
+    showSpinner(false);
+    if (!data.ok) { showGlobalMsg(data.error || '再実行に失敗しました', 'error'); loadInvoices(); return; }
+    showGlobalMsg(`請求を再実行しました（invoice_id: ${invoiceId} → ${data.result.status}）`, data.result.status === 'paid' ? 'success' : 'error');
+    loadInvoices();
+    loadTenants();
   } catch (err) {
     showSpinner(false);
     showGlobalMsg('通信エラー: ' + err.message, 'error');
