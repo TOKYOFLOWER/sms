@@ -281,6 +281,7 @@
     <div class="card">
       <h1>SMS送信侍</h1>
       <p class="sub">GSD会員IDでログイン</p>
+      <p style="font-size:11px;color:var(--muted);margin:-14px 0 var(--s5)">提供: 株式会社東京フラワー</p>
       <form id="loginForm" novalidate>
         <div class="auth-field">
           <label for="login-id">会員ID</label>
@@ -354,7 +355,10 @@
 <div id="app-area" class="hidden">
 
   <header class="topbar">
-    <span class="brandmark">SMS送信侍</span>
+    <div style="display:flex;flex-direction:column;line-height:1.25;flex-shrink:0">
+      <span class="brandmark">SMS送信侍</span>
+      <span style="font-size:9px;color:var(--muted);white-space:nowrap">株式会社東京フラワー</span>
+    </div>
     <div class="who">
       <span class="who-dot"></span>
       <span class="who-name" id="user-name"></span>
@@ -397,6 +401,8 @@
             </div>
             <span class="sender-check">✓</span>
           </div>
+
+          <div id="tenant-status-badge" class="hidden" style="font-size:12px;color:var(--muted);margin:-8px 0 var(--s4);text-align:right"></div>
 
           <form id="smsForm">
             <div class="field">
@@ -762,6 +768,40 @@ function renderApp() {
   document.getElementById('account-label').textContent = userLabel || '';
   switchTab('simple'); // 再ログイン時も必ず「かんたん送信」タブから始める
   loadHistory();
+  loadTenantStatus();
+}
+
+// ── テナント状況表示（STEP7b: myTenantStatus） ──────────────────────
+//   GSD会員(tenant_id='GSD'、tenant管理外の会員も同様に扱われる)では
+//   表示自体を出さない（既存UIを変えないため）。
+//   ※ free_used の上限(freeLimit)は myTenantStatus のレスポンスに含まれない
+//     ため、api.js の PLAN_LIMITS.freeLimit と同じ値をここに明示する。
+//     両プランとも現状30のためこの値で共通化しているが、api.js側の値を
+//     変更した場合はここも合わせて変更すること（単一情報源にできず、
+//     判断に迷った点として実装報告に記載済み）。
+const TENANT_STATUS_FREE_LIMIT = 30;
+
+async function loadTenantStatus() {
+  const el = document.getElementById('tenant-status-badge');
+  el.classList.add('hidden');
+  el.textContent = '';
+  try {
+    const data = await callApi('myTenantStatus', {});
+    if (!data.ok || !data.result) return;
+    const r = data.result;
+    if (!r.tenant_id || r.tenant_id === 'GSD') return; // GSD・tenant管理外は非表示
+
+    const planLabel = r.plan === 'standard' ? 'standard' : 'light';
+    let text = `プラン: ${planLabel} ・ 今月の送信 ${r.sent_count || 0}件`;
+    if (r.status === 'trial') {
+      const remain = Math.max(0, TENANT_STATUS_FREE_LIMIT - (Number(r.free_used) || 0));
+      text += ` ・ 残り無料枠 ${remain}件`;
+    }
+    el.textContent = text;
+    el.classList.remove('hidden');
+  } catch (_) {
+    // 取得失敗時は静かに非表示のまま（既存の送信フローを妨げない）
+  }
 }
 
 function signOut() {

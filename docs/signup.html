@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0C6B43" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0B120E" media="(prefers-color-scheme: dark)">
+  <title>お申し込み | SMS送信侍</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📲</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Space+Grotesk:wght@500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#EDF0ED; --surface:#FFFFFF; --surface-2:#F6F8F6;
+      --border:#D7DED9; --ink:#14201A; --muted:#5C6B62;
+      --brand:#0C6B43; --brand-strong:#0A5837; --brand-tint:#E4F1EA;
+      --gold:#9A7B33; --danger:#C2341D; --danger-tint:#F8E6E2; --focus:#1FA06A;
+      --font-ui:'Noto Sans JP', system-ui, -apple-system, sans-serif;
+      --font-display:'Space Grotesk','Noto Sans JP', sans-serif;
+      --font-mono:'Space Mono', ui-monospace, 'SFMono-Regular', monospace;
+      --r-card:12px; --r-field:9px; --r-chip:7px;
+      --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px;
+      --maxw:560px;
+    }
+    @media (prefers-color-scheme:dark){
+      :root{
+        --bg:#0B120E; --surface:#121C16; --surface-2:#16221B;
+        --border:#243530; --ink:#E8EFEA; --muted:#9CB0A6;
+        --brand:#2FB179; --brand-strong:#3CC489; --brand-tint:#15271E;
+        --gold:#C7A35A; --danger:#F0735B; --danger-tint:#2A1714; --focus:#34B27B;
+      }
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0}
+    body{
+      font-family:var(--font-ui); color:var(--ink); background:var(--bg);
+      font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased;
+      min-height:100dvh;
+    }
+    .wrap{max-width:var(--maxw); margin:0 auto; padding:var(--s4)}
+    .card{
+      background:var(--surface); border:1px solid var(--border);
+      border-radius:var(--r-card); padding:var(--s5);
+      box-shadow:0 1px 0 rgba(20,32,26,.03);
+    }
+    header.page-head{padding:var(--s4) 0 var(--s2)}
+    .brandmark{font-family:var(--font-display); font-weight:700; letter-spacing:.02em; font-size:18px}
+    .provider{font-size:11px; color:var(--muted); margin-top:2px}
+    h1{font-family:var(--font-display); font-weight:700; font-size:20px; margin:0 0 4px}
+    p.sub{color:var(--muted); font-size:13px; margin:0 0 var(--s5); line-height:1.6}
+    .field{margin-bottom:var(--s4)}
+    .eyebrow{font-family:var(--font-mono); font-size:11px; letter-spacing:.1em;
+      text-transform:uppercase; color:var(--muted); margin-bottom:6px}
+    .input,.select{
+      width:100%; font-family:var(--font-ui); font-size:15px; color:var(--ink);
+      background:var(--surface-2); border:1px solid var(--border);
+      border-radius:var(--r-field); padding:12px 14px; min-height:44px;
+    }
+    .input:focus,.select:focus{
+      outline:none; border-color:var(--focus);
+      box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 25%,transparent);
+    }
+    .hint{font-size:12px; color:var(--muted); margin-top:6px; line-height:1.6}
+    .hint code{font-family:var(--font-mono); background:var(--surface-2); border-radius:4px; padding:1px 5px; font-size:11px}
+
+    .phone-row{display:flex; gap:var(--s2); margin-bottom:var(--s2)}
+    .phone-row .input{flex:1}
+    .btn-icon{
+      flex:none; width:44px; min-height:44px; border:1px solid var(--border);
+      background:var(--surface-2); border-radius:var(--r-field); cursor:pointer;
+      font-size:16px; color:var(--muted);
+    }
+    .btn-icon:hover{color:var(--danger); border-color:var(--danger)}
+    .btn-add{
+      width:100%; font:inherit; font-size:13px; color:var(--brand-strong);
+      background:var(--brand-tint); border:1px dashed color-mix(in srgb,var(--brand) 35%,transparent);
+      border-radius:var(--r-field); padding:10px; cursor:pointer; margin-top:2px;
+    }
+    .btn-add:disabled{opacity:.5; cursor:default; color:var(--muted); background:var(--surface-2); border-style:solid}
+
+    .plan-grid{display:grid; grid-template-columns:1fr 1fr; gap:var(--s2)}
+    @media (max-width:420px){ .plan-grid{grid-template-columns:1fr} }
+    .plan-card{
+      display:block; border:1px solid var(--border); border-radius:var(--r-field);
+      padding:var(--s3); cursor:pointer; position:relative;
+    }
+    .plan-card input{position:absolute; top:12px; right:12px; accent-color:var(--brand)}
+    .plan-card.selected{border-color:var(--brand); background:var(--brand-tint)}
+    .plan-name{font-family:var(--font-display); font-weight:700; font-size:15px; margin-bottom:2px}
+    .plan-tagline{font-size:11px; color:var(--muted); margin-bottom:8px}
+    .plan-desc{font-size:12px; color:var(--ink); line-height:1.6; margin:0; padding-left:16px}
+    .plan-desc li{margin-bottom:2px}
+
+    .agree-row{display:flex; align-items:flex-start; gap:var(--s2); margin-bottom:var(--s3); font-size:13px; color:var(--muted); cursor:pointer}
+    .agree-row input{margin-top:3px; width:16px; height:16px; accent-color:var(--brand); flex:none}
+
+    .btn-send{
+      width:100%; font:inherit; font-weight:700; font-size:16px;
+      color:#fff; background:var(--brand); border:0; border-radius:var(--r-field);
+      padding:15px; min-height:50px; cursor:pointer; margin-top:var(--s2);
+    }
+    .btn-send:hover{background:var(--brand-strong)}
+    .btn-send:disabled{background:var(--border); color:var(--muted); cursor:not-allowed}
+
+    .error-box{
+      background:var(--danger-tint); color:var(--danger); border-radius:var(--r-chip);
+      padding:var(--s3); font-size:13px; margin-bottom:var(--s4); line-height:1.6;
+    }
+
+    .foot{
+      max-width:var(--maxw); margin:var(--s5) auto 0; padding:0 var(--s4) var(--s6);
+      text-align:center; color:var(--muted); font-size:12px; line-height:1.7;
+    }
+    .foot .latin{font-family:var(--font-display); letter-spacing:.02em; color:var(--ink)}
+    .foot .sep{opacity:.5; margin:0 6px}
+
+    .hidden{display:none !important}
+
+    #spinner-overlay{
+      position:fixed; inset:0; background:rgba(255,255,255,.75);
+      display:flex; align-items:center; justify-content:center; z-index:200;
+    }
+    @media (prefers-color-scheme:dark){ #spinner-overlay{background:rgba(11,18,14,.8)} }
+    .spinner{
+      width:40px; height:40px; border:4px solid var(--border); border-top-color:var(--brand);
+      border-radius:50%; animation:spin .8s linear infinite;
+    }
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @media (prefers-reduced-motion:reduce){ *{animation-duration:.001ms !important; transition-duration:.001ms !important} }
+  </style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="page-head">
+    <div class="brandmark">SMS送信侍</div>
+    <div class="provider">提供: 株式会社東京フラワー</div>
+  </header>
+
+  <div id="form-view">
+    <div class="card">
+      <h1>お申し込み</h1>
+      <p class="sub">下記フォームにご入力のうえ送信してください。内容を確認のうえ、担当者よりご連絡いたします。</p>
+
+      <div id="error-box" class="error-box hidden"></div>
+
+      <form id="signupForm" novalidate>
+        <div class="field">
+          <div class="eyebrow">会社名 *</div>
+          <input type="text" id="f-company" class="input" required>
+        </div>
+        <div class="field">
+          <div class="eyebrow">代表者名 *</div>
+          <input type="text" id="f-rep" class="input" required>
+        </div>
+        <div class="field">
+          <div class="eyebrow">担当者名 *</div>
+          <input type="text" id="f-contact-name" class="input" required>
+        </div>
+        <div class="field">
+          <div class="eyebrow">担当者メール *</div>
+          <input type="email" id="f-contact-email" class="input" required>
+        </div>
+        <div class="field">
+          <div class="eyebrow">担当者電話 *</div>
+          <input type="tel" id="f-contact-phone" class="input" inputmode="numeric" required>
+        </div>
+        <div class="field">
+          <div class="eyebrow">住所 *</div>
+          <input type="text" id="f-address" class="input" required>
+        </div>
+
+        <div class="field">
+          <div class="eyebrow">送信元電話番号（1〜3件）*</div>
+          <div id="phone-rows"></div>
+          <button type="button" id="add-phone-btn" class="btn-add">＋ 送信元電話番号を追加</button>
+          <div class="hint">SMSを送信する電話番号をご入力ください。楽天モバイルへの番号登録手続きに使用します（登録完了まで約2週間かかります）。</div>
+        </div>
+
+        <div class="field">
+          <div class="eyebrow">番号名義 *</div>
+          <input type="text" id="f-number-owner" class="input" required>
+          <div class="hint">送信元電話番号の契約名義です（会社名と同じで構いません）。</div>
+        </div>
+
+        <div class="field">
+          <div class="eyebrow">希望プラン *</div>
+          <div class="plan-grid">
+            <label class="plan-card" id="plan-card-light">
+              <input type="radio" name="plan" value="light" checked>
+              <div class="plan-name">light</div>
+              <div class="plan-tagline">小規模利用向け</div>
+              <ul class="plan-desc">
+                <li>1日あたり1,000通まで</li>
+                <li>送信元番号 1件</li>
+                <li>テンプレート 5件まで</li>
+                <li>送信履歴 直近3ヶ月分</li>
+              </ul>
+            </label>
+            <label class="plan-card" id="plan-card-standard">
+              <input type="radio" name="plan" value="standard">
+              <div class="plan-name">standard</div>
+              <div class="plan-tagline">本格運用向け</div>
+              <ul class="plan-desc">
+                <li>1日あたり3,000通まで</li>
+                <li>送信元番号 3件まで</li>
+                <li>テンプレート無制限・予約送信可</li>
+                <li>送信履歴 無制限</li>
+              </ul>
+            </label>
+          </div>
+          <div class="hint">料金プランの詳細は、担当者より別途ご案内いたします。</div>
+        </div>
+
+        <div class="field">
+          <div class="eyebrow">業種（任意）</div>
+          <input type="text" id="f-industry" class="input">
+        </div>
+        <div class="field">
+          <div class="eyebrow">想定月間送信数（任意）</div>
+          <input type="text" id="f-monthly-volume" class="input" inputmode="numeric" placeholder="例: 500">
+        </div>
+        <div class="field">
+          <div class="eyebrow">紹介元（任意）</div>
+          <input type="text" id="f-referral" class="input" placeholder="例: Web検索、紹介 など">
+        </div>
+
+        <label class="agree-row">
+          <input type="checkbox" id="f-agree-terms" required>
+          <span>利用規約に同意します。</span>
+        </label>
+        <label class="agree-row">
+          <input type="checkbox" id="f-agree-email-law" required>
+          <span>特定電子メール法に基づく表示事項に同意します。</span>
+        </label>
+
+        <button type="submit" id="submitBtn" class="btn-send">申し込む</button>
+      </form>
+    </div>
+  </div>
+
+  <div id="done-view" class="hidden">
+    <div class="card" style="text-align:center;padding:var(--s6)">
+      <div style="font-size:40px;margin-bottom:var(--s3)">✅</div>
+      <h1 style="margin-bottom:var(--s2)">受付完了しました</h1>
+      <p class="sub" style="margin-bottom:0">お申し込みを受け付けました。担当者よりご連絡いたします。</p>
+    </div>
+  </div>
+</div>
+
+<footer class="foot">
+  <span class="latin">Ginza TOKYOFLOWER</span><span class="sep">·</span>株式会社東京フラワー
+</footer>
+
+<div id="spinner-overlay" class="hidden">
+  <div class="spinner"></div>
+</div>
+
+<script>
+const WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbxRCrEUgkVl0vPPB-SIbQJXcezxswj81xi1d9ak0OPE9CYHuIUs1l0IpYIZycjYXjd3/exec';
+const MAX_PHONES = 3;
+
+document.addEventListener('DOMContentLoaded', () => {
+  addPhoneRow();
+  document.getElementById('add-phone-btn').addEventListener('click', () => addPhoneRow());
+  document.querySelectorAll('input[name="plan"]').forEach(r => r.addEventListener('change', updatePlanCards));
+  updatePlanCards();
+  document.getElementById('signupForm').addEventListener('submit', handleSubmit);
+});
+
+// ── 送信元電話番号の動的行（1〜3件） ─────────────────────────────
+function addPhoneRow() {
+  const container = document.getElementById('phone-rows');
+  if (container.querySelectorAll('.phone-row').length >= MAX_PHONES) return;
+
+  const row = document.createElement('div');
+  row.className = 'phone-row';
+
+  const input = document.createElement('input');
+  input.type = 'tel';
+  input.className = 'input phone-input';
+  input.placeholder = '080xxxxxxxx';
+  input.inputMode = 'numeric';
+  row.appendChild(input);
+
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'btn-icon';
+  removeBtn.setAttribute('aria-label', '削除');
+  removeBtn.textContent = '✕';
+  removeBtn.addEventListener('click', () => {
+    if (container.querySelectorAll('.phone-row').length <= 1) return; // 最低1件は残す
+    row.remove();
+    updateAddPhoneBtn();
+  });
+  row.appendChild(removeBtn);
+
+  container.appendChild(row);
+  updateAddPhoneBtn();
+}
+
+function updateAddPhoneBtn() {
+  const count = document.querySelectorAll('.phone-row').length;
+  const btn = document.getElementById('add-phone-btn');
+  btn.disabled = count >= MAX_PHONES;
+  btn.textContent = count >= MAX_PHONES ? '送信元電話番号は最大3件までです' : '＋ 送信元電話番号を追加';
+}
+
+// ── プランカードの選択状態表示 ──────────────────────────────────
+function updatePlanCards() {
+  const plan = (document.querySelector('input[name="plan"]:checked') || {}).value;
+  document.getElementById('plan-card-light').classList.toggle('selected', plan === 'light');
+  document.getElementById('plan-card-standard').classList.toggle('selected', plan === 'standard');
+}
+
+// ── 送信 ─────────────────────────────────────────────────────────
+async function handleSubmit(e) {
+  e.preventDefault();
+  hideError();
+
+  const phones = Array.from(document.querySelectorAll('.phone-input'))
+    .map(i => i.value.trim())
+    .filter(v => v);
+  if (!phones.length) { showError('送信元電話番号を1件以上入力してください'); return; }
+
+  const agreeTerms    = document.getElementById('f-agree-terms').checked;
+  const agreeEmailLaw = document.getElementById('f-agree-email-law').checked;
+  if (!agreeTerms || !agreeEmailLaw) {
+    showError('利用規約および特定電子メール法に基づく表示への同意が必要です');
+    return;
+  }
+
+  const plan = (document.querySelector('input[name="plan"]:checked') || {}).value || 'light';
+
+  const payload = {
+    action: 'signup',
+    '会社名':         document.getElementById('f-company').value.trim(),
+    '代表者名':       document.getElementById('f-rep').value.trim(),
+    '担当者名':       document.getElementById('f-contact-name').value.trim(),
+    '担当者メール':   document.getElementById('f-contact-email').value.trim(),
+    '担当者電話':     document.getElementById('f-contact-phone').value.trim(),
+    '住所':           document.getElementById('f-address').value.trim(),
+    '送信元電話番号': phones,
+    '番号名義':       document.getElementById('f-number-owner').value.trim(),
+    'plan':           plan,
+    '業種':           document.getElementById('f-industry').value.trim(),
+    '想定月間送信数': document.getElementById('f-monthly-volume').value.trim(),
+    '紹介元':         document.getElementById('f-referral').value.trim(),
+    '規約同意':             agreeTerms,
+    '特定電子メール法同意': agreeEmailLaw
+  };
+
+  const submitBtn = document.getElementById('submitBtn');
+  submitBtn.disabled = true;
+  showSpinner(true);
+  try {
+    const res = await fetch(WEBAPP_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body:    JSON.stringify(payload)
+    });
+    const data = await res.json();
+    showSpinner(false);
+    if (data.ok) {
+      document.getElementById('form-view').classList.add('hidden');
+      document.getElementById('done-view').classList.remove('hidden');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } else {
+      showError(data.error || '送信できませんでした。入力内容をご確認ください。');
+      submitBtn.disabled = false;
+    }
+  } catch (err) {
+    showSpinner(false);
+    showError('通信エラーが発生しました: ' + err.message);
+    submitBtn.disabled = false;
+  }
+}
+
+function showError(msg) {
+  const box = document.getElementById('error-box');
+  box.textContent = msg;
+  box.classList.remove('hidden');
+  box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+function hideError() {
+  document.getElementById('error-box').classList.add('hidden');
+}
+function showSpinner(visible) {
+  document.getElementById('spinner-overlay').classList.toggle('hidden', !visible);
+}
+</script>
+</body>
+</html>

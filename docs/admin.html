@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0C6B43" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0B120E" media="(prefers-color-scheme: dark)">
+  <title>管理画面 | SMS送信侍</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛠️</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Space+Grotesk:wght@500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#EDF0ED; --surface:#FFFFFF; --surface-2:#F6F8F6;
+      --border:#D7DED9; --ink:#14201A; --muted:#5C6B62;
+      --brand:#0C6B43; --brand-strong:#0A5837; --brand-tint:#E4F1EA;
+      --gold:#9A7B33; --danger:#C2341D; --danger-tint:#F8E6E2; --focus:#1FA06A;
+      --font-ui:'Noto Sans JP', system-ui, -apple-system, sans-serif;
+      --font-display:'Space Grotesk','Noto Sans JP', sans-serif;
+      --font-mono:'Space Mono', ui-monospace, 'SFMono-Regular', monospace;
+      --r-card:12px; --r-field:9px; --r-chip:7px;
+      --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px;
+      --maxw:960px;
+    }
+    @media (prefers-color-scheme:dark){
+      :root{
+        --bg:#0B120E; --surface:#121C16; --surface-2:#16221B;
+        --border:#243530; --ink:#E8EFEA; --muted:#9CB0A6;
+        --brand:#2FB179; --brand-strong:#3CC489; --brand-tint:#15271E;
+        --gold:#C7A35A; --danger:#F0735B; --danger-tint:#2A1714; --focus:#34B27B;
+      }
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0}
+    body{
+      font-family:var(--font-ui); color:var(--ink); background:var(--bg);
+      font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased;
+      min-height:100dvh;
+    }
+    .topbar{
+      display:flex; align-items:center; justify-content:space-between; gap:var(--s3);
+      padding:var(--s3) var(--s4); background:var(--surface); border-bottom:1px solid var(--border);
+    }
+    .brandmark{font-family:var(--font-display); font-weight:700; font-size:16px}
+    .provider{font-size:10px; color:var(--muted)}
+    .wrap{max-width:var(--maxw); margin:0 auto; padding:var(--s4)}
+    .card{
+      background:var(--surface); border:1px solid var(--border);
+      border-radius:var(--r-card); padding:var(--s5); margin-bottom:var(--s4);
+      box-shadow:0 1px 0 rgba(20,32,26,.03);
+    }
+    .card h2{font-family:var(--font-display); font-weight:700; font-size:15px; margin:0 0 var(--s4)}
+    .eyebrow{font-family:var(--font-mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin-bottom:6px}
+    .field{margin-bottom:var(--s3)}
+    .input,.select{
+      width:100%; font-family:var(--font-ui); font-size:14px; color:var(--ink);
+      background:var(--surface-2); border:1px solid var(--border);
+      border-radius:var(--r-field); padding:10px 12px; min-height:40px;
+    }
+    .input:focus,.select:focus{outline:none; border-color:var(--focus); box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 25%,transparent)}
+    .row{display:flex; gap:var(--s2); flex-wrap:wrap; align-items:flex-end}
+    .row > *{flex:1; min-width:120px}
+    .btn{
+      font:inherit; font-size:13px; font-weight:600; color:#fff; background:var(--brand);
+      border:0; border-radius:var(--r-field); padding:10px 16px; cursor:pointer; white-space:nowrap;
+    }
+    .btn:hover{background:var(--brand-strong)}
+    .btn:disabled{background:var(--border); color:var(--muted); cursor:not-allowed}
+    .btn-ghost{
+      font:inherit; font-size:13px; color:var(--muted); background:transparent;
+      border:1px solid var(--border); border-radius:var(--r-chip); padding:8px 12px; cursor:pointer;
+    }
+    .btn-ghost:hover{color:var(--ink); border-color:var(--muted)}
+    table{width:100%; border-collapse:collapse; font-size:13px}
+    th,td{text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:middle}
+    th{font-family:var(--font-mono); font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); white-space:nowrap}
+    tr.selected{background:var(--brand-tint)}
+    .table-wrap{overflow-x:auto}
+    .badge{font-size:11px; padding:2px 8px; border-radius:999px; white-space:nowrap; display:inline-block}
+    .badge.active{background:var(--brand-tint); color:var(--brand-strong)}
+    .badge.trial{background:var(--surface-2); color:var(--muted); border:1px solid var(--border)}
+    .badge.pending{background:#FFF6DD; color:var(--gold)}
+    .badge.registered{background:var(--brand-tint); color:var(--brand-strong)}
+    .badge.other{background:var(--danger-tint); color:var(--danger)}
+    .msg{font-size:13px; padding:var(--s3); border-radius:var(--r-chip); margin-bottom:var(--s4)}
+    .msg.success{background:var(--brand-tint); color:var(--brand-strong)}
+    .msg.error{background:var(--danger-tint); color:var(--danger)}
+    .auth-card{max-width:360px; margin:16vh auto 0; padding:var(--s4)}
+    .hidden{display:none !important}
+    .hint{font-size:11px; color:var(--muted); margin-top:4px}
+    .btn-small{font-size:12px; padding:6px 10px}
+    #spinner-overlay{
+      position:fixed; inset:0; background:rgba(255,255,255,.6);
+      display:flex; align-items:center; justify-content:center; z-index:200;
+    }
+    @media (prefers-color-scheme:dark){ #spinner-overlay{background:rgba(11,18,14,.7)} }
+    .spinner{width:32px; height:32px; border:4px solid var(--border); border-top-color:var(--brand); border-radius:50%; animation:spin .8s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+
+<!-- ── ログイン（ADMIN_SECRET） ─────────────────────────────────── -->
+<div id="login-view">
+  <div class="auth-card">
+    <div class="card">
+      <h2>管理画面ログイン</h2>
+      <p style="font-size:12px;color:var(--muted);margin:-8px 0 var(--s4)">SMS送信侍 / 株式会社東京フラワー</p>
+      <div id="login-error" class="msg error hidden"></div>
+      <div class="field">
+        <div class="eyebrow">ADMIN_SECRET</div>
+        <input type="password" id="admin-secret-input" class="input" autocomplete="off">
+        <div class="hint">この値はブラウザに保存されません（ページを閉じると再入力が必要です）。</div>
+      </div>
+      <button type="button" id="login-btn" class="btn" style="width:100%">ログイン</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 管理画面本体 ─────────────────────────────────────────────── -->
+<div id="admin-view" class="hidden">
+  <header class="topbar">
+    <div>
+      <div class="brandmark">SMS送信侍 管理画面</div>
+      <div class="provider">株式会社東京フラワー</div>
+    </div>
+    <button type="button" class="btn-ghost" id="logout-btn">ログアウト</button>
+  </header>
+
+  <div class="wrap">
+    <div id="global-msg" class="msg hidden"></div>
+
+    <!-- テナント一覧 -->
+    <div class="card">
+      <h2>テナント一覧</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>会社名</th><th>tenant_id</th><th>プラン</th><th>ステータス</th>
+              <th>申込日</th><th>trial_end</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tenants-tbody"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:var(--s3)">
+        <button type="button" class="btn-ghost btn-small" id="reload-tenants-btn">再読み込み</button>
+      </div>
+    </div>
+
+    <!-- プラン変更 -->
+    <div class="card" id="plan-change-card">
+      <h2>プラン・ステータス変更</h2>
+      <div class="row">
+        <div class="field">
+          <div class="eyebrow">対象 tenant_id</div>
+          <input type="text" id="pc-tenant-id" class="input">
+        </div>
+        <div class="field">
+          <div class="eyebrow">plan</div>
+          <select id="pc-plan" class="select">
+            <option value="">（変更しない）</option>
+            <option value="light">light</option>
+            <option value="standard">standard</option>
+          </select>
+        </div>
+        <div class="field">
+          <div class="eyebrow">status</div>
+          <select id="pc-status" class="select">
+            <option value="">（変更しない）</option>
+            <option value="trial">trial</option>
+            <option value="active">active</option>
+            <option value="pending_number">pending_number</option>
+            <option value="suspended">suspended</option>
+          </select>
+        </div>
+        <div class="field">
+          <button type="button" class="btn" id="pc-submit-btn">更新</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 送信元番号管理 -->
+    <div class="card" id="sender-card">
+      <h2>送信元番号管理（テナント一覧の「選択」から表示）</h2>
+      <div id="sender-empty" class="hint">テナント一覧から「選択」を押すと、そのテナントの送信元番号一覧が表示されます。</div>
+      <div class="table-wrap">
+        <table id="sender-table" class="hidden">
+          <thead>
+            <tr>
+              <th>電話番号</th><th>名義</th><th>status</th><th>申請日</th><th>登録日</th>
+              <th>sms_account_key</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="sender-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- アカウント発行 -->
+    <div class="card">
+      <h2>アカウント発行</h2>
+      <div class="row">
+        <div class="field">
+          <div class="eyebrow">tenant_id</div>
+          <input type="text" id="ia-tenant-id" class="input">
+        </div>
+        <div class="field">
+          <div class="eyebrow">会員ID</div>
+          <input type="text" id="ia-id" class="input">
+        </div>
+        <div class="field">
+          <div class="eyebrow">メールアドレス</div>
+          <input type="email" id="ia-email" class="input">
+        </div>
+        <div class="field">
+          <div class="eyebrow">担当者名（任意）</div>
+          <input type="text" id="ia-contact-name" class="input">
+        </div>
+        <div class="field">
+          <button type="button" class="btn" id="ia-submit-btn">発行する</button>
+        </div>
+      </div>
+      <div class="hint">初期パスワードを発行し、指定したメールアドレスへ送信します。</div>
+    </div>
+  </div>
+</div>
+
+<div id="spinner-overlay" class="hidden"><div class="spinner"></div></div>
+
+<script>
+const WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbxRCrEUgkVl0vPPB-SIbQJXcezxswj81xi1d9ak0OPE9CYHuIUs1l0IpYIZycjYXjd3/exec';
+
+// ADMIN_SECRETはJS変数のみで保持する（localStorage/sessionStorageには一切保存しない。
+// ページをリロードすると再入力が必要になる仕様は意図的なXSS対策）。
+let adminSecret = null;
+let tenantsCache = [];
+let selectedTenantId = null;
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('login-btn').addEventListener('click', handleLogin);
+  document.getElementById('admin-secret-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') handleLogin();
+  });
+  document.getElementById('logout-btn').addEventListener('click', handleLogout);
+  document.getElementById('reload-tenants-btn').addEventListener('click', loadTenants);
+  document.getElementById('pc-submit-btn').addEventListener('click', handlePlanChangeSubmit);
+  document.getElementById('ia-submit-btn').addEventListener('click', handleIssueAccountSubmit);
+});
+
+// ── ログイン ─────────────────────────────────────────────────────
+async function handleLogin() {
+  const secret = document.getElementById('admin-secret-input').value.trim();
+  if (!secret) return;
+  hideLoginError();
+  showSpinner(true);
+  try {
+    const data = await callApi('listTenants', {}, secret);
+    showSpinner(false);
+    if (!data.ok) {
+      showLoginError(data.error || 'ログインできませんでした');
+      return;
+    }
+    adminSecret = secret;
+    document.getElementById('login-view').classList.add('hidden');
+    document.getElementById('admin-view').classList.remove('hidden');
+    renderTenants(data.result.tenants || []);
+  } catch (err) {
+    showSpinner(false);
+    showLoginError('通信エラー: ' + err.message);
+  }
+}
+
+function handleLogout() {
+  adminSecret = null;
+  tenantsCache = [];
+  selectedTenantId = null;
+  document.getElementById('admin-secret-input').value = '';
+  document.getElementById('admin-view').classList.add('hidden');
+  document.getElementById('login-view').classList.remove('hidden');
+}
+
+// ── テナント一覧 ──────────────────────────────────────────────────
+async function loadTenants() {
+  showSpinner(true);
+  try {
+    const data = await callApi('listTenants', {});
+    showSpinner(false);
+    if (!data.ok) { showGlobalMsg(data.error || 'テナント一覧の取得に失敗しました', 'error'); return; }
+    renderTenants(data.result.tenants || []);
+  } catch (err) {
+    showSpinner(false);
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+function renderTenants(tenants) {
+  tenantsCache = tenants;
+  const tbody = document.getElementById('tenants-tbody');
+  if (!tenants.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">テナントがありません</td></tr>';
+    return;
+  }
+  tbody.innerHTML = tenants.map(t => {
+    const status = String(t['status'] || '');
+    const badgeClass = status === 'active' ? 'active' : (status === 'trial' ? 'trial' : (status === 'pending_number' ? 'pending' : 'other'));
+    const trialEnd = formatDateCell(t['trial_end']);
+    const appliedAt = formatDateCell(t['申込日']);
+    return `<tr data-tenant-id="${escHtml(t['tenant_id'] || '')}">
+      <td>${escHtml(t['会社名'] || '')}</td>
+      <td style="font-family:var(--font-mono)">${escHtml(t['tenant_id'] || '')}</td>
+      <td>${escHtml(t['plan'] || '')}</td>
+      <td><span class="badge ${badgeClass}">${escHtml(status)}</span></td>
+      <td>${escHtml(appliedAt)}</td>
+      <td>${escHtml(trialEnd)}</td>
+      <td><button type="button" class="btn-ghost btn-small select-tenant-btn">選択</button></td>
+    </tr>`;
+  }).join('');
+
+  tbody.querySelectorAll('.select-tenant-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const tr = e.target.closest('tr');
+      selectTenant(tr.dataset.tenantId);
+    });
+  });
+}
+
+function selectTenant(tenantId) {
+  selectedTenantId = tenantId;
+  document.querySelectorAll('#tenants-tbody tr').forEach(tr => {
+    tr.classList.toggle('selected', tr.dataset.tenantId === tenantId);
+  });
+  document.getElementById('pc-tenant-id').value = tenantId;
+  document.getElementById('ia-tenant-id').value = tenantId;
+  loadSenderNumbers(tenantId);
+}
+
+// ── 送信元番号管理 ────────────────────────────────────────────────
+async function loadSenderNumbers(tenantId) {
+  showSpinner(true);
+  try {
+    const data = await callApi('listSenderNumbersAdmin', { tenant_id: tenantId });
+    showSpinner(false);
+    if (!data.ok) { showGlobalMsg(data.error || '送信元番号の取得に失敗しました', 'error'); return; }
+    renderSenderNumbers(tenantId, data.result.senderNumbers || []);
+  } catch (err) {
+    showSpinner(false);
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+function renderSenderNumbers(tenantId, rows) {
+  document.getElementById('sender-empty').classList.add('hidden');
+  const table = document.getElementById('sender-table');
+  table.classList.remove('hidden');
+  const tbody = document.getElementById('sender-tbody');
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">送信元番号がありません</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map((r, idx) => {
+    const status = String(r['status'] || '');
+    const badgeClass = status === 'registered' ? 'registered' : (status === 'pending' ? 'pending' : 'other');
+    return `<tr>
+      <td style="font-family:var(--font-mono)">${escHtml(r['電話番号'] || '')}</td>
+      <td>${escHtml(r['名義'] || '')}</td>
+      <td>
+        <select class="select sender-status-select" data-idx="${idx}">
+          <option value="pending"${status === 'pending' ? ' selected' : ''}>pending</option>
+          <option value="registered"${status === 'registered' ? ' selected' : ''}>registered</option>
+          <option value="rejected"${status === 'rejected' ? ' selected' : ''}>rejected</option>
+        </select>
+      </td>
+      <td>${escHtml(formatDateCell(r['申請日']))}</td>
+      <td>${escHtml(formatDateCell(r['登録日']))}</td>
+      <td><input type="text" class="input sender-key-input" data-idx="${idx}" value="${escHtml(r['sms_account_key'] || '')}" style="min-height:32px;padding:6px 8px"></td>
+      <td><button type="button" class="btn btn-small sender-update-btn" data-idx="${idx}">更新</button></td>
+    </tr>`;
+  }).join('');
+
+  tbody.querySelectorAll('.sender-update-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.idx);
+      const row = rows[idx];
+      const statusSel = tbody.querySelector(`.sender-status-select[data-idx="${idx}"]`);
+      const keyInput  = tbody.querySelector(`.sender-key-input[data-idx="${idx}"]`);
+      updateSenderNumberRow(tenantId, row['電話番号'], statusSel.value, keyInput.value.trim());
+    });
+  });
+}
+
+async function updateSenderNumberRow(tenantId, phone, status, smsAccountKey) {
+  showSpinner(true);
+  try {
+    const data = await callApi('updateSenderNumber', {
+      tenant_id: tenantId, '電話番号': phone, status: status, sms_account_key: smsAccountKey
+    });
+    showSpinner(false);
+    if (!data.ok) { showGlobalMsg(data.error || '更新に失敗しました', 'error'); return; }
+    showGlobalMsg(`送信元番号を更新しました（${phone} → ${status}）`, 'success');
+    loadSenderNumbers(tenantId);
+  } catch (err) {
+    showSpinner(false);
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+// ── プラン・ステータス変更 ────────────────────────────────────────
+async function handlePlanChangeSubmit() {
+  const tenantId = document.getElementById('pc-tenant-id').value.trim();
+  const plan     = document.getElementById('pc-plan').value;
+  const status   = document.getElementById('pc-status').value;
+  if (!tenantId) { showGlobalMsg('tenant_id を入力してください', 'error'); return; }
+  if (!plan && !status) { showGlobalMsg('plan または status のいずれかを選択してください', 'error'); return; }
+
+  const body = { tenant_id: tenantId };
+  if (plan) body.plan = plan;
+  if (status) body.status = status;
+
+  showSpinner(true);
+  try {
+    const data = await callApi('updateTenant', body);
+    showSpinner(false);
+    if (!data.ok) { showGlobalMsg(data.error || '更新に失敗しました', 'error'); return; }
+    showGlobalMsg(`テナント ${tenantId} を更新しました`, 'success');
+    document.getElementById('pc-plan').value = '';
+    document.getElementById('pc-status').value = '';
+    loadTenants();
+  } catch (err) {
+    showSpinner(false);
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+// ── アカウント発行 ────────────────────────────────────────────────
+async function handleIssueAccountSubmit() {
+  const tenantId = document.getElementById('ia-tenant-id').value.trim();
+  const id       = document.getElementById('ia-id').value.trim();
+  const email    = document.getElementById('ia-email').value.trim();
+  const contactName = document.getElementById('ia-contact-name').value.trim();
+  if (!tenantId || !id || !email) { showGlobalMsg('tenant_id / 会員ID / メールアドレスは必須です', 'error'); return; }
+
+  showSpinner(true);
+  try {
+    const data = await callApi('issueAccount', {
+      tenant_id: tenantId, id: id, email: email, contact_name: contactName
+    });
+    showSpinner(false);
+    if (!data.ok) { showGlobalMsg(data.error || 'アカウント発行に失敗しました', 'error'); return; }
+    showGlobalMsg(`アカウントを発行しました（id: ${data.result.id}）。初期パスワードを ${email} 宛に送信しました。`, 'success');
+    document.getElementById('ia-id').value = '';
+    document.getElementById('ia-email').value = '';
+    document.getElementById('ia-contact-name').value = '';
+  } catch (err) {
+    showSpinner(false);
+    showGlobalMsg('通信エラー: ' + err.message, 'error');
+  }
+}
+
+// ── 共通ヘルパー ──────────────────────────────────────────────────
+async function callApi(action, payload, overrideSecret) {
+  const body = Object.assign({ action, admin_secret: overrideSecret || adminSecret }, payload);
+  const res = await fetch(WEBAPP_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body:    JSON.stringify(body)
+  });
+  return res.json();
+}
+
+function formatDateCell(v) {
+  if (!v) return '';
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return String(v);
+  return d.toLocaleString('ja-JP', { year: 'numeric', month: '2-digit', day: '2-digit' });
+}
+
+function showGlobalMsg(msg, type) {
+  const el = document.getElementById('global-msg');
+  el.textContent = msg;
+  el.className = 'msg ' + (type || '');
+  el.classList.remove('hidden');
+  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function showLoginError(msg) {
+  const el = document.getElementById('login-error');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+function hideLoginError() {
+  document.getElementById('login-error').classList.add('hidden');
+}
+
+function showSpinner(visible) {
+  document.getElementById('spinner-overlay').classList.toggle('hidden', !visible);
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>

@@ -138,6 +138,8 @@ function doPost(e) {
       case 'listSenderNumbers':    result = handleListSenderNumbers_(body);    break;
       case 'exportHistory':        result = handleExportHistory_(body);        break;
       case 'monthlyReport':        result = handleMonthlyReport_(body);        break;
+      case 'myTenantStatus':       result = handleMyTenantStatus_(body);       break;
+
       // ---- STEP2: 管理API（すべて requireAdmin_ で ADMIN_SECRET 必須。bootstrapAdminのみ例外） ----
       case 'bootstrapAdmin':       result = handleBootstrapAdmin_(body);       break;
       case 'setup':                result = handleAdminSetup_(body);           break;
@@ -145,6 +147,7 @@ function doPost(e) {
       case 'listTenants':          result = handleListTenants_(body);          break;
       case 'updateTenant':         result = handleUpdateTenant_(body);         break;
       case 'updateSenderNumber':   result = handleUpdateSenderNumber_(body);   break;
+      case 'listSenderNumbersAdmin': result = handleListSenderNumbersAdmin_(body); break;
       case 'issueAccount':         result = handleIssueAccount_(body);         break;
 
       default: throw new Error('unknown action: ' + action);
@@ -1563,6 +1566,34 @@ function handleUpdateSenderNumber_(body) {
   throw new Error('該当する sender_number が見つかりません（tenant_id/電話番号を確認してください）');
 }
 
+// listSenderNumbersAdmin: 指定tenant_idのsender_numbers全行を返す（STEP7b管理画面用。
+//   会員向けlistSenderNumbers_はtokenから自分のtenant_idを解決するが、管理画面は
+//   任意のテナントを見る必要があるためtenant_idをbodyで明示的に受け取る）。
+function handleListSenderNumbersAdmin_(body) {
+  requireAdmin_(body);
+  var tenantId = String(body.tenant_id || '').trim();
+  if (!tenantId) throw new Error('tenant_id は必須です');
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('sender_numbers');
+  if (!sheet || sheet.getLastRow() < 2) return { senderNumbers: [] };
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined) return { senderNumbers: [] };
+
+  var out = [];
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== tenantId) continue;
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+    out.push(obj);
+  }
+  return { senderNumbers: out };
+}
+
 // issueAccount: 会員マスタ(api_key, MASTER_SHEET_ID)に新規会員行を作成し、
 //   初期パスワードを発行して担当者メールへ送信する。
 //   既存の pw 格納形式（'BASE64:' プレフィックス付きBase64、decodeBase64Str_ が復号）に合わせる。
@@ -2022,6 +2053,33 @@ function countTemplatesForTenant_(tenantId) {
     if (String(data[r][idx]).trim() === String(tenantId).trim()) count++;
   }
   return count;
+}
+
+// myTenantStatus: 呼び出し会員のtenant状況を返す軽量API（STEP7bのフロント表示用）。
+//   tenants未登録(GSD等)はresolveTenantForMember_のフォールバックにより
+//   plan='standard'相当・daily_limit=null(無制限)を返す。
+function handleMyTenantStatus_(body) {
+  var member = requireEntitledMember_(body);
+  var tenant = resolveTenantForMember_(member);
+  var ym     = currentYearMonth_();
+  var usage  = getUsageRow_(tenant.tenant_id, ym) || { free_used: 0, sent_count: 0, billable_count: 0 };
+
+  var isGsd = String(tenant.tenant_id).trim() === 'GSD';
+  var dailyLimit = null; // GSD・tenants未登録は無制限扱い（既存運用に影響しない値）
+  if (!isGsd) {
+    var limits = getPlanLimits_(tenant);
+    dailyLimit = Number(tenant.daily_limit) > 0 ? Number(tenant.daily_limit) : limits.dailyLimit;
+  }
+
+  return {
+    tenant_id:   tenant.tenant_id,
+    plan:        tenant.plan || 'standard',
+    status:      tenant.status || 'active',
+    free_used:   usage.free_used,
+    sent_count:  usage.sent_count,
+    daily_limit: dailyLimit,
+    todaySent:   countTodaySent_(tenant.tenant_id)
+  };
 }
 
 // listTemplates: 呼び出し会員のtenant_idに紐づくtemplates全行を返す
