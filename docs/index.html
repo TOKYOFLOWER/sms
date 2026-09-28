@@ -242,6 +242,35 @@
     .history-status.ok{background:var(--brand-tint); color:var(--brand-strong)}
     .history-status.err{background:var(--danger-tint); color:var(--danger)}
     .history-msg{font-size:13px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+
+    /* ── タブ切り替え（addendum E） ─────────────────── */
+    .tabbar{
+      display:flex; gap:2px; overflow-x:auto; margin-bottom:var(--s4);
+      border-bottom:1px solid var(--border); -webkit-overflow-scrolling:touch;
+    }
+    .tabbar::-webkit-scrollbar{display:none}
+    .tab-btn{
+      font:inherit; font-size:13px; font-weight:500; color:var(--muted);
+      background:transparent; border:none; border-bottom:2px solid transparent;
+      padding:10px 14px; cursor:pointer; white-space:nowrap; flex:none;
+    }
+    .tab-btn.active{color:var(--brand-strong); border-bottom-color:var(--brand); font-weight:700}
+    .tab-btn:disabled{color:var(--border); cursor:default}
+    .tab-panel.hidden{display:none}
+
+    /* ── 一斉送信（CSVアップロード） ────────────────── */
+    .bulk-hint{font-size:12px; color:var(--muted); margin-top:6px; line-height:1.6}
+    .bulk-hint code{
+      font-family:var(--font-mono); background:var(--surface-2);
+      border-radius:4px; padding:1px 5px; font-size:11px;
+    }
+    .bulk-summary{font-size:13px; color:var(--muted); margin-bottom:var(--s3)}
+    .bulk-preview-item{padding:var(--s3) 0; border-bottom:1px solid var(--border)}
+    .bulk-preview-item:last-child{border-bottom:none}
+    .bulk-preview-text{font-size:13px; color:var(--ink); white-space:pre-wrap; word-break:break-all; margin-top:4px}
+    .bulk-error-item{padding:var(--s2) 0; border-bottom:1px solid var(--border); font-size:13px; color:var(--danger)}
+    .bulk-error-item:last-child{border-bottom:none}
+    .placeholder-card{text-align:center; padding:var(--s6)}
   </style>
 </head>
 <body>
@@ -335,65 +364,135 @@
 
   <div class="wrap">
 
-    <div id="checking-area" class="hidden">
-      <p class="center-msg">確認中...</p>
+    <!-- ── タブ切り替え（addendum E） ──────────────────────────────── -->
+    <div class="tabbar" id="tabbar">
+      <button type="button" class="tab-btn active" data-tab="simple">かんたん送信</button>
+      <button type="button" class="tab-btn" data-tab="bulk">一斉送信</button>
+      <button type="button" class="tab-btn" data-tab="schedule">予約</button>
+      <button type="button" class="tab-btn" data-tab="template">テンプレート</button>
+      <button type="button" class="tab-btn" data-tab="report">レポート</button>
     </div>
 
-    <div id="no-permission-area" class="hidden">
-      <div class="card" style="text-align:center;padding:var(--s6)">
-        <p style="color:var(--danger);margin-bottom:var(--s2)">送信権限がありません</p>
-        <p style="font-size:13px;color:var(--muted)">管理者に連絡してください</p>
+    <!-- ── かんたん送信タブ：既存の送信フォーム・履歴をそのままタブコンテナで包む ── -->
+    <div id="tab-simple" class="tab-panel">
+
+      <div id="checking-area" class="hidden">
+        <p class="center-msg">確認中...</p>
       </div>
+
+      <div id="no-permission-area" class="hidden">
+        <div class="card" style="text-align:center;padding:var(--s6)">
+          <p style="color:var(--danger);margin-bottom:var(--s2)">送信権限がありません</p>
+          <p style="font-size:13px;color:var(--muted)">管理者に連絡してください</p>
+        </div>
+      </div>
+
+      <div id="form-section" class="hidden">
+        <div class="card">
+
+          <div class="sender" id="account-badge">
+            <div>
+              <div class="sender-label">送信元 · SENDER</div>
+              <div class="sender-name" id="account-label"></div>
+            </div>
+            <span class="sender-check">✓</span>
+          </div>
+
+          <form id="smsForm">
+            <div class="field">
+              <div class="eyebrow">宛先 · TO</div>
+              <div class="row">
+                <select id="countryCode" name="countryCode" class="select"></select>
+                <input
+                  type="tel"
+                  id="phoneNumber"
+                  name="phoneNumber"
+                  class="input"
+                  placeholder="080xxxxxxxx"
+                  inputmode="numeric"
+                  required
+                >
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="eyebrow">本文 · MESSAGE</div>
+              <textarea id="message" name="message" class="textarea" rows="5" required></textarea>
+              <div class="meter" id="charCount">0 / 660 (0 SMS)</div>
+            </div>
+
+            <button type="submit" id="sendBtn" class="btn-send" disabled>送信する</button>
+          </form>
+
+          <span id="ping-link">疎通確認 (ping)</span>
+        </div>
+      </div>
+
+      <div id="history-section" class="hidden" style="margin-top:var(--s4)">
+        <div class="card">
+          <div class="eyebrow" style="margin-bottom:var(--s4)">送信履歴 · HISTORY</div>
+          <div id="history-loading" class="center-msg hidden">読み込み中...</div>
+          <div id="history-error" class="hidden" style="color:var(--danger);font-size:14px;padding:var(--s2) 0"></div>
+          <div id="history-empty" class="center-msg hidden">まだ送信履歴はありません</div>
+          <div id="history-list"></div>
+        </div>
+      </div>
+
     </div>
 
-    <div id="form-section" class="hidden">
+    <!-- ── 一斉送信タブ（STEP4b：CSVアップロード） ─────────────────── -->
+    <div id="tab-bulk" class="tab-panel hidden">
       <div class="card">
 
-        <div class="sender" id="account-badge">
-          <div>
-            <div class="sender-label">送信元 · SENDER</div>
-            <div class="sender-name" id="account-label"></div>
+        <div class="field">
+          <div class="eyebrow">CSVファイル · UPLOAD</div>
+          <input type="file" id="bulkCsvFile" accept=".csv" class="input" style="padding:9px 14px;min-height:auto">
+          <div class="bulk-hint">
+            列: <code>to</code>（必須・電話番号）, <code>name</code>（任意）ほか、自由な列名を差し込み変数として使えます。
           </div>
-          <span class="sender-check">✓</span>
         </div>
 
-        <form id="smsForm">
-          <div class="field">
-            <div class="eyebrow">宛先 · TO</div>
-            <div class="row">
-              <select id="countryCode" name="countryCode" class="select"></select>
-              <input
-                type="tel"
-                id="phoneNumber"
-                name="phoneNumber"
-                class="input"
-                placeholder="080xxxxxxxx"
-                inputmode="numeric"
-                required
-              >
-            </div>
+        <div class="field">
+          <div class="eyebrow">本文テンプレート · MESSAGE</div>
+          <textarea id="bulkTemplate" class="textarea" rows="5" placeholder="こんにちは{{name}}様、..."></textarea>
+          <div class="bulk-hint">
+            <code>{{列名}}</code> の形式でCSVの値を差し込めます（例: <code>{{name}}</code>）。CSVに無い列名は空文字になります。
           </div>
+        </div>
 
-          <div class="field">
-            <div class="eyebrow">本文 · MESSAGE</div>
-            <textarea id="message" name="message" class="textarea" rows="5" required></textarea>
-            <div class="meter" id="charCount">0 / 660 (0 SMS)</div>
-          </div>
+        <div class="field">
+          <div class="eyebrow">予約日時（任意）· SCHEDULE</div>
+          <input type="datetime-local" id="bulkScheduledAt" class="input">
+          <div class="bulk-hint">未入力の場合はすぐに送信キューへ投入されます。プランによっては予約送信がご利用いただけません。</div>
+        </div>
 
-          <button type="submit" id="sendBtn" class="btn-send" disabled>送信する</button>
-        </form>
+        <div id="bulkSummary" class="bulk-summary hidden"></div>
+        <div id="bulkPreview"></div>
 
-        <span id="ping-link">疎通確認 (ping)</span>
+        <button type="button" id="bulkSendBtn" class="btn-send" disabled>一斉送信する</button>
+      </div>
+
+      <div id="bulkResult" class="card hidden" style="margin-top:var(--s4)"></div>
+    </div>
+
+    <!-- ── 予約タブ（STEP5以降で実装予定） ──────────────────────────── -->
+    <div id="tab-schedule" class="tab-panel hidden">
+      <div class="card placeholder-card">
+        <p style="color:var(--muted)">予約送信の一覧・管理機能は近日公開予定です。</p>
       </div>
     </div>
 
-    <div id="history-section" class="hidden" style="margin-top:var(--s4)">
-      <div class="card">
-        <div class="eyebrow" style="margin-bottom:var(--s4)">送信履歴 · HISTORY</div>
-        <div id="history-loading" class="center-msg hidden">読み込み中...</div>
-        <div id="history-error" class="hidden" style="color:var(--danger);font-size:14px;padding:var(--s2) 0"></div>
-        <div id="history-empty" class="center-msg hidden">まだ送信履歴はありません</div>
-        <div id="history-list"></div>
+    <!-- ── テンプレートタブ（STEP5以降で実装予定） ──────────────────── -->
+    <div id="tab-template" class="tab-panel hidden">
+      <div class="card placeholder-card">
+        <p style="color:var(--muted)">テンプレート管理機能は近日公開予定です。</p>
+      </div>
+    </div>
+
+    <!-- ── レポートタブ（STEP5以降で実装予定） ──────────────────────── -->
+    <div id="tab-report" class="tab-panel hidden">
+      <div class="card placeholder-card">
+        <p style="color:var(--muted)">利用状況レポート機能は近日公開予定です。</p>
       </div>
     </div>
 
@@ -489,6 +588,21 @@ function setupEventListeners() {
   });
   document.getElementById('confirmBtn').addEventListener('click', handleConfirm);
   document.getElementById('ping-link').addEventListener('click', pingTest);
+
+  setupTabs();
+  setupBulkSend();
+}
+
+// ── タブ切り替え（addendum E） ───────────────────────────────────
+function setupTabs() {
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+  });
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('hidden', p.id !== 'tab-' + tab));
 }
 
 // ── 画面ステップ切り替え ─────────────────────────────────────────
@@ -646,6 +760,7 @@ function renderApp() {
   document.getElementById('no-permission-area').classList.add('hidden');
   document.getElementById('form-section').classList.remove('hidden');
   document.getElementById('account-label').textContent = userLabel || '';
+  switchTab('simple'); // 再ログイン時も必ず「かんたん送信」タブから始める
   loadHistory();
 }
 
@@ -783,6 +898,185 @@ async function pingTest() {
     showSpinner(false);
     showToast('ping 失敗: ' + err.message, 'error');
   }
+}
+
+// ── 一斉送信（STEP4b：CSVアップロード） ─────────────────────────────
+//   ・SMS_RULES（上部で定義済み）を api.js の SMS_RULES と共有する単一情報源とする。
+//   ・renderBulkTemplate は api.js の renderTemplate_ と完全に同一ロジック
+//     （{{key}} をrowの値に置換、未定義キーは空文字）にすること。
+let bulkRows = [];      // CSVから読み込んだ行（{to, name, ...}の配列）
+let bulkHeader = [];    // CSVヘッダー
+
+function setupBulkSend() {
+  document.getElementById('bulkCsvFile').addEventListener('change', handleBulkCsvChange);
+  document.getElementById('bulkTemplate').addEventListener('input', updateBulkPreview);
+  document.getElementById('bulkSendBtn').addEventListener('click', handleBulkSendClick);
+}
+
+// 素朴なCSVパーサー（カンマ区切り・ダブルクォート囲みの簡易対応）
+function parseCsvLine(line) {
+  const result = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      result.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  result.push(cur);
+  return result.map(s => s.trim());
+}
+
+function parseCsv(text) {
+  const lines = String(text || '').split(/\r\n|\n|\r/).filter(l => l.length > 0);
+  if (lines.length === 0) return { header: [], rows: [] };
+  const header = parseCsvLine(lines[0]);
+  const rows = lines.slice(1).map(parseCsvLine);
+  return { header, rows };
+}
+
+// {{key}} 差し込み記法の置換（api.js renderTemplate_ と同一ロジック。未定義キーは空文字）
+function renderBulkTemplate(template, vars) {
+  return String(template || '').replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
+    return (vars && vars[key] !== undefined && vars[key] !== null) ? String(vars[key]) : '';
+  });
+}
+
+// 文字数・分割数（api.js calcSegments_ と同じ SMS_RULES を使用。表示専用なので例外は投げない）
+function calcSegmentsDisplay(text) {
+  const len  = String(text || '').length;
+  const segs = len === 0 ? 0 : Math.ceil(len / SMS_RULES.SEGMENT);
+  const over = len > SMS_RULES.MAX;
+  return { len, segs, over };
+}
+
+function handleBulkCsvChange(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = parseCsv(String(reader.result));
+      if (!parsed.header.includes('to')) {
+        showToast('CSVに to 列が見つかりません', 'error');
+        bulkRows = []; bulkHeader = [];
+        updateBulkPreview();
+        return;
+      }
+      bulkHeader = parsed.header;
+      bulkRows = parsed.rows.map(cols => {
+        const obj = {};
+        parsed.header.forEach((h, i) => { obj[h] = cols[i] !== undefined ? cols[i] : ''; });
+        return obj;
+      });
+      updateBulkPreview();
+    } catch (err) {
+      showToast('CSVの読み込みに失敗しました: ' + err.message, 'error');
+    }
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+function updateBulkPreview() {
+  const template = document.getElementById('bulkTemplate').value;
+  const summaryEl = document.getElementById('bulkSummary');
+  const previewEl = document.getElementById('bulkPreview');
+  const sendBtn   = document.getElementById('bulkSendBtn');
+
+  if (!bulkRows.length) {
+    summaryEl.classList.add('hidden');
+    previewEl.innerHTML = '';
+    sendBtn.disabled = true;
+    return;
+  }
+
+  summaryEl.textContent = `CSVを${bulkRows.length}件読み込みました（列: ${bulkHeader.join(', ')}）`;
+  summaryEl.classList.remove('hidden');
+
+  const previewRows = bulkRows.slice(0, 5);
+  previewEl.innerHTML =
+    `<div class="eyebrow" style="margin:var(--s4) 0 var(--s2)">プレビュー（先頭${previewRows.length}件 / 全${bulkRows.length}件）</div>` +
+    previewRows.map(row => {
+      const text = renderBulkTemplate(template, row);
+      const { len, segs, over } = calcSegmentsDisplay(text);
+      return `<div class="bulk-preview-item">
+        <div class="history-meta">
+          <span class="history-to">${escHtml(row.to || '(toなし)')}</span>
+          <span class="meter${over ? ' over' : ''}" style="margin-left:auto">${len} / ${SMS_RULES.MAX} (${segs} SMS)</span>
+        </div>
+        <div class="bulk-preview-text">${escHtml(text)}</div>
+      </div>`;
+    }).join('');
+
+  sendBtn.disabled = !template.trim();
+}
+
+async function handleBulkSendClick() {
+  if (!bulkRows.length) return;
+  const template = document.getElementById('bulkTemplate').value;
+  if (!template.trim()) { showToast('本文テンプレートを入力してください', 'error'); return; }
+
+  if (!window.confirm(`${bulkRows.length}件へ送信します。よろしいですか？`)) return;
+
+  const payload = { recipients: bulkRows, bodyTemplate: template };
+  const scheduledAtInput = document.getElementById('bulkScheduledAt').value;
+  if (scheduledAtInput) {
+    const d = new Date(scheduledAtInput); // datetime-local はローカル時刻文字列 → Dateへ変換してISOで送る
+    if (isNaN(d.getTime())) { showToast('予約日時が不正です', 'error'); return; }
+    payload.scheduledAt = d.toISOString();
+  }
+
+  const sendBtn = document.getElementById('bulkSendBtn');
+  sendBtn.disabled = true;
+  showSpinner(true);
+  try {
+    const data = await callApi('bulkSend', payload);
+    showSpinner(false);
+    renderBulkResult(data);
+  } catch (err) {
+    showSpinner(false);
+    showToast('通信エラー: ' + err.message, 'error');
+  } finally {
+    sendBtn.disabled = !(bulkRows.length && document.getElementById('bulkTemplate').value.trim());
+  }
+}
+
+function renderBulkResult(data) {
+  const el = document.getElementById('bulkResult');
+  el.classList.remove('hidden');
+
+  if (!data.ok) {
+    el.innerHTML = `<p style="color:var(--danger)">送信できませんでした: ${escHtml(data.error || '不明なエラー')}</p>`;
+    showToast(data.error || '送信できませんでした', 'error');
+    return;
+  }
+
+  const result  = data.result || {};
+  const queued  = result.queued || 0;
+  const errors  = result.errors || [];
+
+  let html = `<p style="color:var(--brand-strong);font-weight:700;margin:0 0 var(--s2)">${queued}件を送信キューに投入しました。</p>`;
+  if (errors.length) {
+    html += `<div class="eyebrow" style="margin:var(--s3) 0 var(--s2)">送信できなかった行（${errors.length}件）</div>`;
+    html += errors.map(er =>
+      `<div class="bulk-error-item">${escHtml((Number(er.index) + 1) + '行目 (' + (er.to || '宛先不明') + '): ' + er.error)}</div>`
+    ).join('');
+  }
+  el.innerHTML = html;
+  showToast(queued > 0 ? `${queued}件を送信キューに投入しました` : '送信できるrecipientsがありませんでした', queued > 0 ? 'success' : 'error');
 }
 
 // ── GAS Web App API 呼び出し ──────────────────────────────────────
