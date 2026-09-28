@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(clasp push --user tokyoflower*)",
+      "Bash(clasp deploy --user tokyoflower -d dev-*)",
+      "Bash(clasp deployments --user tokyoflower*)",
+      "Bash(clasp pull --user tokyoflower*)",
+      "Bash(clasp undeploy * --user tokyoflower*)"
+    ]
+  }
+}

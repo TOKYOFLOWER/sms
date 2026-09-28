@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0C6B43" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0B120E" media="(prefers-color-scheme: dark)">
+  <title>SMS送信侍 | 会社の固定電話番号からブラウザでSMS送信</title>
+  <meta name="description" content="会社の固定電話番号から、ブラウザだけでSMSが送れる。月額0円・初期費用0円、送った分だけ1通15円。">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📲</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Space+Grotesk:wght@500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#EDF0ED; --surface:#FFFFFF; --surface-2:#F6F8F6;
+      --border:#D7DED9; --ink:#14201A; --muted:#5C6B62;
+      --brand:#0C6B43; --brand-strong:#0A5837; --brand-tint:#E4F1EA;
+      --gold:#9A7B33; --danger:#C2341D; --danger-tint:#F8E6E2; --focus:#1FA06A;
+      --font-ui:'Noto Sans JP', system-ui, -apple-system, sans-serif;
+      --font-display:'Space Grotesk','Noto Sans JP', sans-serif;
+      --font-mono:'Space Mono', ui-monospace, 'SFMono-Regular', monospace;
+      --r-card:12px; --r-field:9px; --r-chip:7px;
+      --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:20px; --s6:24px;
+      --maxw:720px;
+    }
+    @media (prefers-color-scheme:dark){
+      :root{
+        --bg:#0B120E; --surface:#121C16; --surface-2:#16221B;
+        --border:#243530; --ink:#E8EFEA; --muted:#9CB0A6;
+        --brand:#2FB179; --brand-strong:#3CC489; --brand-tint:#15271E;
+        --gold:#C7A35A; --danger:#F0735B; --danger-tint:#2A1714; --focus:#34B27B;
+      }
+    }
+    *{box-sizing:border-box}
+    html{overflow-x:hidden}
+    html,body{margin:0}
+    body{
+      font-family:var(--font-ui); color:var(--ink); background:var(--bg);
+      font-size:15px; line-height:1.6; -webkit-font-smoothing:antialiased;
+      min-height:100dvh; overflow-x:hidden;
+    }
+    img,table{max-width:100%}
+    .wrap{max-width:var(--maxw); margin:0 auto; padding:0 var(--s4)}
+
+    .topbar{
+      display:flex; align-items:center; justify-content:space-between; gap:var(--s3);
+      padding:var(--s3) var(--s4); background:var(--surface); border-bottom:1px solid var(--border);
+      position:sticky; top:0; z-index:10;
+    }
+    .brandmark{font-family:var(--font-display); font-weight:700; font-size:17px; white-space:nowrap}
+    .provider{font-size:10px; color:var(--muted); white-space:nowrap}
+    .btn-cta{
+      font:inherit; font-weight:700; font-size:13px; color:#fff; background:var(--brand);
+      border:0; border-radius:var(--r-field); padding:10px 16px; cursor:pointer;
+      text-decoration:none; white-space:nowrap; flex:none;
+    }
+    .btn-cta:hover{background:var(--brand-strong)}
+    .btn-cta-large{display:inline-block; font-size:16px; padding:15px 32px; border-radius:var(--r-field)}
+
+    section{padding:var(--s6) 0}
+    .hero{text-align:center; padding:var(--s6) 0 var(--s5)}
+    .hero h1{
+      font-family:var(--font-display); font-weight:700; font-size:26px; line-height:1.4;
+      margin:0 0 var(--s3); word-break:break-word;
+    }
+    .hero-price{font-size:16px; font-weight:500; margin:0 0 var(--s4); line-height:1.7}
+    .hero-price strong{color:var(--brand-strong); font-family:var(--font-display); font-size:19px}
+    .hero p.lead{color:var(--muted); font-size:15px; max-width:480px; margin:0 auto var(--s5)}
+
+    .eyebrow{font-family:var(--font-mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); text-align:center; margin-bottom:var(--s2)}
+    h2.section-title{font-family:var(--font-display); font-weight:700; font-size:21px; text-align:center; margin:0 0 var(--s5); word-break:break-word}
+
+    /* 選ばれる3つの理由 */
+    .reason-list{display:flex; flex-direction:column; gap:var(--s4)}
+    .reason-card{
+      background:var(--surface); border:1px solid var(--border); border-radius:var(--r-card);
+      padding:var(--s4) var(--s4) var(--s4) 56px; position:relative;
+    }
+    .reason-num{
+      position:absolute; left:var(--s4); top:var(--s4);
+      width:28px; height:28px; border-radius:50%; background:var(--brand-tint); color:var(--brand-strong);
+      font-family:var(--font-display); font-weight:700; font-size:14px;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .reason-card h3{font-family:var(--font-display); font-weight:700; font-size:15px; margin:0 0 6px}
+    .reason-card p{color:var(--muted); font-size:13px; line-height:1.7; margin:0}
+
+    /* こんな場面で */
+    .usecase-list{list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:var(--s2)}
+    .usecase-list li{
+      background:var(--surface); border:1px solid var(--border); border-radius:var(--r-field);
+      padding:var(--s3) var(--s4); font-size:13px; line-height:1.6; word-break:break-word;
+    }
+    .usecase-list li::before{content:"・"; color:var(--brand); font-weight:700; margin-right:2px}
+
+    /* 機能チップ */
+    .chip-list{display:flex; flex-wrap:wrap; gap:8px; justify-content:center; padding:0; margin:0; list-style:none}
+    .chip{
+      background:var(--surface); border:1px solid var(--border); border-radius:999px;
+      padding:7px 14px; font-size:12px; color:var(--ink); white-space:nowrap;
+    }
+
+    /* 料金表 */
+    .price-table-wrap{overflow:hidden; border-radius:var(--r-card); border:1px solid var(--border)}
+    table.price-table{width:100%; border-collapse:collapse; table-layout:fixed; font-size:12px}
+    .price-table th, .price-table td{
+      border-bottom:1px solid var(--border); border-right:1px solid var(--border);
+      padding:9px 5px; text-align:center; word-break:break-word; overflow-wrap:break-word;
+      vertical-align:middle; line-height:1.4;
+    }
+    .price-table th:last-child, .price-table td:last-child{border-right:none}
+    .price-table thead th{
+      background:var(--surface-2); font-family:var(--font-mono); font-size:10px;
+      letter-spacing:.02em; color:var(--muted); font-weight:700;
+    }
+    .price-table tbody th, .price-table tbody td:first-child{
+      text-align:left; font-weight:500; background:var(--surface-2); font-size:11.5px;
+    }
+    .price-table tbody tr:last-child td, .price-table tbody tr:last-child th{border-bottom:none}
+    .price-table td.featured-col{background:var(--brand-tint); color:var(--brand-strong); font-weight:700}
+    .price-note{font-size:11px; color:var(--muted); margin-top:var(--s3); line-height:1.8}
+
+    /* まずは無料で */
+    .trial-box{
+      background:var(--brand-tint); border-radius:var(--r-card); padding:var(--s5);
+      text-align:center; font-size:14px; line-height:1.9; color:var(--ink);
+    }
+    .trial-box strong{color:var(--brand-strong); font-family:var(--font-display)}
+
+    /* 導入までの流れ */
+    .steps{counter-reset:step; display:flex; flex-direction:column; gap:var(--s4)}
+    .step{display:flex; gap:var(--s3); align-items:flex-start}
+    .step .num{
+      counter-increment:step; flex:none; width:30px; height:30px; border-radius:50%;
+      background:var(--brand-tint); color:var(--brand-strong); font-family:var(--font-display); font-weight:700;
+      display:flex; align-items:center; justify-content:center; font-size:14px;
+    }
+    .step .num::before{content:counter(step)}
+    .step-body{min-width:0}
+    .step-body h3{font-family:var(--font-display); font-weight:700; font-size:14px; margin:0 0 4px; word-break:break-word}
+    .step-body p{color:var(--muted); font-size:13px; margin:0; line-height:1.6; word-break:break-word}
+    .steps-note{font-size:12px; color:var(--muted); margin-top:var(--s4); line-height:1.7}
+
+    /* よくある質問 */
+    .faq-item{border-bottom:1px solid var(--border); padding:var(--s4) 0}
+    .faq-item:last-child{border-bottom:none}
+    .faq-q{
+      font-family:var(--font-display); font-weight:700; font-size:14px; margin:0 0 6px;
+      display:flex; gap:8px; word-break:break-word;
+    }
+    .faq-q .mark{color:var(--brand); flex:none}
+    .faq-a{color:var(--muted); font-size:13px; line-height:1.8; margin:0; padding-left:24px; word-break:break-word}
+
+    /* 自社実績 */
+    .case-box{
+      background:var(--surface); border:1px solid var(--border); border-radius:var(--r-card);
+      padding:var(--s5); font-size:14px; line-height:1.9; color:var(--ink);
+    }
+
+    .cta-section{
+      text-align:center; background:var(--brand-tint); border-radius:var(--r-card);
+      padding:var(--s6) var(--s4);
+    }
+    .cta-section h2{margin-bottom:var(--s3)}
+    .cta-section p{color:var(--muted); margin-bottom:var(--s5)}
+
+    .foot{
+      max-width:var(--maxw); margin:var(--s5) auto 0; padding:0 var(--s4) var(--s6);
+      text-align:center; color:var(--muted); font-size:12px; line-height:2;
+    }
+    .foot a{color:var(--muted)}
+    .foot a:hover{color:var(--ink)}
+  </style>
+</head>
+<body>
+
+<header class="topbar">
+  <div>
+    <div class="brandmark">SMS送信侍</div>
+    <div class="provider">提供: 株式会社東京フラワー</div>
+  </div>
+  <a class="btn-cta" href="./signup.html">無料で申し込む</a>
+</header>
+
+<!-- ── Hero ─────────────────────────────────────────────────────── -->
+<section class="hero">
+  <div class="wrap">
+    <h1>会社の固定電話番号から、<br>ブラウザだけでSMSが送れる。</h1>
+    <p class="hero-price">月額0円・初期費用0円、送った分だけ<strong>1通15円</strong>。</p>
+    <p class="lead">メールは開かれない。電話は出ない。SMSなら届く。</p>
+    <a class="btn-cta btn-cta-large" href="./signup.html">無料で申し込む</a>
+  </div>
+</section>
+
+<!-- ── 選ばれる3つの理由 ────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Reasons</div>
+    <h2 class="section-title">選ばれる3つの理由</h2>
+    <div class="reason-list">
+      <div class="reason-card">
+        <div class="reason-num">1</div>
+        <h3>送信元が「御社の固定電話番号」</h3>
+        <p>お客様のスマホには 03-XXXX-XXXX（御社の番号）から届きます。知らない番号ではないので開封され、そのまま折り返し電話もしてもらえます。</p>
+      </div>
+      <div class="reason-card">
+        <div class="reason-num">2</div>
+        <h3>固定費ゼロ、1通15円だけ</h3>
+        <p>初期費用・月額・最低利用期間・解約金、すべてなし。使わない月は請求ゼロ。</p>
+      </div>
+      <div class="reason-card">
+        <div class="reason-num">3</div>
+        <h3>IT担当者がいなくても使える</h3>
+        <p>アプリも機器も不要。パソコン・スマホのブラウザからログインして送るだけ。個別送信もCSV一斉送信も、同じ画面で。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── こんな場面で ─────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Use Cases</div>
+    <h2 class="section-title">こんな場面で</h2>
+    <ul class="usecase-list">
+      <li>発送・入荷・準備完了のお知らせ</li>
+      <li>予約前日のリマインド、来店確認</li>
+      <li>不在着信の代わりの一言（「先ほどお電話しました。◯◯です」）</li>
+      <li>受け取り・期限・未払いのお知らせ</li>
+      <li>少人数リストへのセール告知</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── 機能 ─────────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Features</div>
+    <h2 class="section-title">機能</h2>
+    <ul class="chip-list">
+      <li class="chip">個別送信</li>
+      <li class="chip">CSV一斉送信（宛名差し込み）</li>
+      <li class="chip">予約送信</li>
+      <li class="chip">テンプレート</li>
+      <li class="chip">送信履歴</li>
+      <li class="chip">スタッフID発行</li>
+      <li class="chip">送信元番号の複数登録</li>
+      <li class="chip">月次レポート</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ── 料金表 ───────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Pricing</div>
+    <h2 class="section-title">料金プラン</h2>
+    <div class="price-table-wrap">
+      <table class="price-table">
+        <thead>
+          <tr>
+            <th scope="col">項目</th>
+            <th scope="col">ライト</th>
+            <th scope="col">スタンダード</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">初期費用</th><td>0円</td><td>0円</td></tr>
+          <tr><th scope="row">月額</th><td>0円</td><td>5,500円</td></tr>
+          <tr><th scope="row">送信料</th><td>15円/通</td><td>500通込み・超過12円/通</td></tr>
+          <tr><th scope="row">スタッフID</th><td>3つまで</td><td>無制限</td></tr>
+          <tr><th scope="row">送信元番号</th><td>1番号</td><td>3番号</td></tr>
+          <tr><th scope="row">予約送信</th><td>–</td><td>○</td></tr>
+          <tr><th scope="row">テンプレート</th><td>5件</td><td>無制限</td></tr>
+          <tr><th scope="row">履歴保存</th><td>3か月</td><td>無期限＋CSV出力</td></tr>
+          <tr><th scope="row">月次レポート</th><td>–</td><td>○</td></tr>
+          <tr><th scope="row">サポート</th><td>メール</td><td>メール＋電話</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="price-note">
+      税別。月末締め、翌月クレジットカード決済。プランはいつでも変更可。月400通以上ならスタンダードがお得です。
+    </p>
+  </div>
+</section>
+
+<!-- ── まずは無料で ─────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Free Trial</div>
+    <h2 class="section-title">まずは無料で</h2>
+    <div class="trial-box">
+      お申込み月の月末まで、<strong>30通まで無料</strong>。<br>
+      翌月から自動的にご利用プランに切り替わります。<br>
+      使わなければ請求はありません。解約手続きも不要です。
+    </div>
+  </div>
+</section>
+
+<!-- ── 導入までの流れ ───────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Flow</div>
+    <h2 class="section-title">導入までの流れ</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="num"></div>
+        <div class="step-body">
+          <h3>申込フォーム送信（約3分）</h3>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num"></div>
+        <div class="step-body">
+          <h3>当社にて送信元番号を各社システムへ登録申請（約2週間）</h3>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num"></div>
+        <div class="step-body">
+          <h3>アカウント発行メール到着 → クレジットカード登録 → 送信開始</h3>
+        </div>
+      </div>
+    </div>
+    <p class="steps-note">※番号登録の完了を待つ間も、共通番号でのテスト送信は可能です。</p>
+  </div>
+</section>
+
+<!-- ── よくある質問 ─────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">FAQ</div>
+    <h2 class="section-title">よくある質問</h2>
+
+    <div class="faq-item">
+      <p class="faq-q"><span class="mark">Q.</span>返信はできますか</p>
+      <p class="faq-a">送信専用です。本文末に「返信不可・お問い合わせは◯◯まで」の定型文をご用意しています。</p>
+    </div>
+    <div class="faq-item">
+      <p class="faq-q"><span class="mark">Q.</span>対応キャリアは</p>
+      <p class="faq-a">docomo / au / SoftBank / 楽天モバイル、格安SIM各社。</p>
+    </div>
+    <div class="faq-item">
+      <p class="faq-q"><span class="mark">Q.</span>1通の文字数は</p>
+      <p class="faq-a">全角70文字まで1通。超えた分は自動分割され、分割数分の課金になります。</p>
+    </div>
+    <div class="faq-item">
+      <p class="faq-q"><span class="mark">Q.</span>セキュリティは</p>
+      <p class="faq-a">ID＋パスワード＋メールワンタイムコード。信頼済み端末は30日間省略できます。</p>
+    </div>
+    <div class="faq-item">
+      <p class="faq-q"><span class="mark">Q.</span>広告に使えますか</p>
+      <p class="faq-a">特定電子メール法に沿った運用（同意取得・送信者表示・オプトアウト案内）が必要です。規約でガイドラインを定めています。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── 自社実績 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="eyebrow">Our Story</div>
+    <h2 class="section-title">自社実績</h2>
+    <div class="case-box">
+      銀座東京フラワーでは、母の日・お盆など繁忙期の発送連絡と店頭受け取りの前日確認に日常利用しています。花屋が自分の店のために作ったツールを、そのままご提供します。
+    </div>
+  </div>
+</section>
+
+<!-- ── CTA ──────────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="cta-section">
+      <h2 class="section-title" style="margin-bottom:var(--s3)">まずは無料で試す</h2>
+      <p>申込フォームは約3分で完了します。</p>
+      <a class="btn-cta btn-cta-large" href="./signup.html">無料で申し込む</a>
+    </div>
+  </div>
+</section>
+
+<footer class="foot">
+  <p>提供：株式会社東京フラワー</p>
+  <p><a href="#">特定商取引法に基づく表記</a></p>
+</footer>
+
+</body>
+</html>
