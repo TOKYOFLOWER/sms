@@ -125,6 +125,14 @@ function doPost(e) {
       case 'listHistory':          result = handleListHistory_(body);          break;
       case 'ping':                 result = handlePing_(body);                 break;
 
+      // ---- STEP5a: テンプレート・送信元番号・履歴エクスポート・月次レポート（すべてtoken必須） ----
+      case 'listTemplates':        result = handleListTemplates_(body);        break;
+      case 'createTemplate':       result = handleCreateTemplate_(body);       break;
+      case 'updateTemplate':       result = handleUpdateTemplate_(body);       break;
+      case 'deleteTemplate':       result = handleDeleteTemplate_(body);       break;
+      case 'listSenderNumbers':    result = handleListSenderNumbers_(body);    break;
+      case 'exportHistory':        result = handleExportHistory_(body);        break;
+      case 'monthlyReport':        result = handleMonthlyReport_(body);        break;
       // ---- STEP2: 管理API（すべて requireAdmin_ で ADMIN_SECRET 必須。bootstrapAdminのみ例外） ----
       case 'bootstrapAdmin':       result = handleBootstrapAdmin_(body);       break;
       case 'setup':                result = handleAdminSetup_(body);           break;
@@ -1950,4 +1958,342 @@ function deleteUsageRow_(sheet, tenantId, yearMonth) {
     }
   }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// STEP5a: テンプレートCRUD・送信元番号一覧・履歴CSVエクスポート・月次レポート
+//   すべてtoken必須。tenant解決はbulkSendと同じ方針を踏襲する:
+//   member.tenant_id → getTenantById_、tenants未登録（GSD含む）は
+//   無制限のGSD同様の挙動（plan='standard'相当）にフォールバックする
+//   （既存運用への影響回避を最優先。resolveTenantForMember_ に集約）。
+// ────────────────────────────────────────────────────────────────────
+
+// 会員のtenant_idからtenantオブジェクトを解決する共通ヘルパー（bulkSendの方針を踏襲）
+function resolveTenantForMember_(member) {
+  var tenantId = (member && member.tenant_id) || 'GSD';
+  return getTenantById_(tenantId) || { tenant_id: 'GSD', plan: 'standard', status: 'active' };
+}
+
+// token検証 + 会員の有効性確認をまとめたヘルパー（STEP5a各actionで共通）
+function requireEntitledMember_(body) {
+  var claims = verifyToken_(body.token);
+  var member = getMember_(claims.id);
+  if (!member || !isEntitled_(member)) {
+    throw new Error('ご契約が有効でないか、送信権限がありません');
+  }
+  return member;
+}
+
+// 指定シートの実ヘッダー順に合わせて1行を追記する（対応なしは空文字）
+function appendRowByHeaderNames_(sheet, valuesByName) {
+  var lastCol = sheet.getLastColumn();
+  var hdr = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
+              .map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var row = hdr.map(function(h) { return valuesByName.hasOwnProperty(h) ? valuesByName[h] : ''; });
+  sheet.appendRow(row);
+}
+
+// ── テンプレートCRUD ──────────────────────────────────────────────
+
+function countTemplatesForTenant_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('templates');
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var idx  = hdr.indexOf('tenant_id');
+  if (idx === -1) return 0;
+  var count = 0;
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][idx]).trim() === String(tenantId).trim()) count++;
+  }
+  return count;
+}
+
+// listTemplates: 呼び出し会員のtenant_idに紐づくtemplates全行を返す
+function handleListTemplates_(body) {
+  var member   = requireEntitledMember_(body);
+  var tenantId = member.tenant_id || 'GSD';
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('templates');
+  if (!sheet || sheet.getLastRow() < 2) return { templates: [] };
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined) return { templates: [] };
+
+  var out = [];
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+    out.push(obj);
+  }
+  return { templates: out };
+}
+
+// createTemplate: プラン上限(checkTemplateLimit_)チェック → templatesへ1行追加
+function handleCreateTemplate_(body) {
+  var member = requireEntitledMember_(body);
+  var name   = String(body['名称'] || '').trim();
+  var text   = String(body['本文'] || '').trim();
+  if (!name || !text) throw new Error('名称と本文は必須です');
+
+  var tenant       = resolveTenantForMember_(member);
+  var currentCount = countTemplatesForTenant_(tenant.tenant_id);
+  var limitCheck   = checkTemplateLimit_(tenant, currentCount);
+  if (!limitCheck.allowed) {
+    throw new Error('プランのテンプレート上限（' + limitCheck.limit + '件）に達しています。standardプランで無制限になります');
+  }
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('templates');
+  if (!sheet) throw new Error('templates タブが存在しません');
+
+  var templateId = Utilities.getUuid();
+  var now        = new Date();
+  appendRowByHeaderNames_(sheet, {
+    template_id: templateId, tenant_id: tenant.tenant_id,
+    '名称': name, '本文': text, created_by: member.id, created_at: now
+  });
+
+  return { template_id: templateId, tenant_id: tenant.tenant_id, '名称': name, '本文': text };
+}
+
+// updateTemplate / deleteTemplate: 該当tenant_idの行のみ操作可能（他テナントのものは見えない）
+function handleUpdateTemplate_(body) {
+  var member     = requireEntitledMember_(body);
+  var tenantId   = member.tenant_id || 'GSD';
+  var templateId = String(body.template_id || '').trim();
+  if (!templateId) throw new Error('template_id は必須です');
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('templates');
+  if (!sheet) throw new Error('templates タブが存在しません');
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['template_id']]).trim() !== templateId) continue;
+    // 他テナントのtemplate_idは「存在しない」ものとして扱う（見えない・操作不可）
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) break;
+
+    if (body['名称'] !== undefined && col['名称'] !== undefined) {
+      sheet.getRange(r + 1, col['名称'] + 1).setValue(body['名称']);
+    }
+    if (body['本文'] !== undefined && col['本文'] !== undefined) {
+      sheet.getRange(r + 1, col['本文'] + 1).setValue(body['本文']);
+    }
+    return { template_id: templateId, updated: true };
+  }
+  throw new Error('template_id が見つかりません: ' + templateId);
+}
+
+function handleDeleteTemplate_(body) {
+  var member     = requireEntitledMember_(body);
+  var tenantId   = member.tenant_id || 'GSD';
+  var templateId = String(body.template_id || '').trim();
+  if (!templateId) throw new Error('template_id は必須です');
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('templates');
+  if (!sheet) throw new Error('templates タブが存在しません');
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['template_id']]).trim() !== templateId) continue;
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) break;
+    sheet.deleteRow(r + 1);
+    return { template_id: templateId, deleted: true };
+  }
+  throw new Error('template_id が見つかりません: ' + templateId);
+}
+
+// ── 送信元番号一覧 ────────────────────────────────────────────────
+
+// listSenderNumbers: 呼び出し会員のtenant_idに紐づくsender_numbers全行を返す。
+//   usable=true は status='registered' の場合のみ。'pending'には案内文を付与する。
+//   ※ 実際の送信元切り替え（複数登録番号からの選択送信）はSTEP5aの範囲では実装しない
+//     （sendSingleSMSFromFormの「1会員1送信元(sms_accounts)」という既存設計を変えない
+//     ため。未registeredの番号での代替送信＝共通テスト番号の利用は、既存のsms_accounts
+//     側の設定をそのまま使う運用を想定し、コード上の新しい切り替えロジックは追加しない。
+//     判断の詳細は実装報告を参照）。
+function handleListSenderNumbers_(body) {
+  var member   = requireEntitledMember_(body);
+  var tenantId = member.tenant_id || 'GSD';
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('sender_numbers');
+  if (!sheet || sheet.getLastRow() < 2) return { senderNumbers: [] };
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined) return { senderNumbers: [] };
+
+  var out = [];
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+
+    var status = String(obj['status'] || '').trim().toLowerCase();
+    obj.usable = status === 'registered';
+    if (status === 'pending') {
+      obj.statusMessage = '登録申請中（約2週間）';
+    } else if (obj.usable) {
+      obj.statusMessage = '利用可能';
+    } else {
+      obj.statusMessage = status ? ('ステータス: ' + status) : '';
+    }
+    out.push(obj);
+  }
+  return { senderNumbers: out };
+}
+
+// ── 履歴CSVエクスポート ──────────────────────────────────────────
+
+// CSV 1行分の組み立て（カンマ・ダブルクォート・改行を含む値はダブルクォートで囲む）
+function toCsvLine_(fields) {
+  return fields.map(function(f) {
+    var s = (f === undefined || f === null) ? '' : String(f);
+    if (/[",\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }).join(',');
+}
+
+// log タブの「送信日時」列（'yyyy/MM/dd HH:mm:ss' 文字列 or Date）をDateへ変換する
+function parseLogDateStr_(v) {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  var s = String(v).trim();
+  var m = s.match(/^(\d{4})\/(\d{2})\/(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
+  var d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// exportHistory: tenant.planがstandardなら全期間、lightならgetHistoryMonthsLimit_(3ヶ月)分の
+//   log行をCSV文字列にして返す。列選定は既存のhandleListHistory_に準ずる
+//   （送信日時・宛先・メッセージ内容・ステータス）。
+function handleExportHistory_(body) {
+  var member = requireEntitledMember_(body);
+  var tenant = resolveTenantForMember_(member);
+
+  var csvHeader = ['送信日時', '宛先', 'メッセージ内容', 'ステータス'];
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('log');
+  if (!sheet || sheet.getLastRow() < 2) {
+    return { csv: toCsvLine_(csvHeader) };
+  }
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+
+  var dtCol     = col['送信日時'];
+  var toCol     = col['to'];
+  var msgCol    = col['メッセージ内容'];
+  var stCol     = col['ステータス'];
+  var tenantCol = col['tenant_id'];
+
+  var monthsLimit = getHistoryMonthsLimit_(tenant); // light=3, standard=null(無制限)
+  var cutoff = null;
+  if (monthsLimit) {
+    cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - monthsLimit);
+  }
+
+  var lines = [toCsvLine_(csvHeader)];
+  for (var r = 1; r < data.length; r++) {
+    if (tenantCol !== undefined && String(data[r][tenantCol]).trim() !== String(tenant.tenant_id).trim()) continue;
+
+    var dtRaw = dtCol !== undefined ? data[r][dtCol] : '';
+    if (cutoff) {
+      var dtDate = parseLogDateStr_(dtRaw);
+      if (dtDate && dtDate < cutoff) continue;
+    }
+    var dtStr = dtRaw instanceof Date
+      ? Utilities.formatDate(dtRaw, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss')
+      : String(dtRaw || '');
+
+    lines.push(toCsvLine_([
+      dtStr,
+      toCol  !== undefined ? String(data[r][toCol]  || '') : '',
+      msgCol !== undefined ? String(data[r][msgCol] || '') : '',
+      stCol  !== undefined ? String(data[r][stCol]  || '') : ''
+    ]));
+  }
+
+  return { csv: lines.join('\n') };
+}
+
+// ── 月次レポート（standardのみ） ──────────────────────────────────
+
+// monthlyReport: usageタブのsent_count（=課金対象の分割通数）＋logタブ集計の到達率を返す。
+//   ※ usage.sent_count はSTEP4aのincrementUsage_でcalcSegments_(body)の分割数分を
+//     加算しているため、生の送信件数ではなく既に「分割通数」である。そのため
+//     レスポンスの sent_count と 分割通数 は同じ値になる（コーディネーター指示の通り、
+//     両フィールドともusage.sent_countをそのまま使う）。
+function handleMonthlyReport_(body) {
+  var member = requireEntitledMember_(body);
+  var tenant = resolveTenantForMember_(member);
+
+  if (String(tenant.plan || '').trim().toLowerCase() !== 'standard') {
+    throw new Error('月次レポートはstandardプランで利用可能です');
+  }
+
+  var yearMonth = String(body.yearMonth || currentYearMonth_()).trim();
+  if (!/^\d{6}$/.test(yearMonth)) throw new Error('yearMonth はyyyyMM形式で指定してください（例: 202609）');
+
+  var usage = getUsageRow_(tenant.tenant_id, yearMonth) || { sent_count: 0, free_used: 0, billable_count: 0 };
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('log');
+  var sentCount = 0, failedCount = 0;
+
+  if (sheet && sheet.getLastRow() >= 2) {
+    var data = sheet.getDataRange().getValues();
+    var hdr  = data[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+    var col  = {};
+    hdr.forEach(function(h, i) { col[h] = i; });
+
+    var dtCol     = col['送信日時'];
+    var stCol     = col['ステータス'];
+    var tenantCol = col['tenant_id'];
+
+    for (var r = 1; r < data.length; r++) {
+      if (tenantCol !== undefined && String(data[r][tenantCol]).trim() !== String(tenant.tenant_id).trim()) continue;
+      var dtDate = dtCol !== undefined ? parseLogDateStr_(data[r][dtCol]) : null;
+      if (!dtDate) continue;
+      if (Utilities.formatDate(dtDate, 'Asia/Tokyo', 'yyyyMM') !== yearMonth) continue;
+
+      var status = stCol !== undefined ? String(data[r][stCol] || '') : '';
+      if (status.indexOf('成功') !== -1) sentCount++;
+      else failedCount++;
+    }
+  }
+
+  var total        = sentCount + failedCount;
+  var deliveryRate = total === 0 ? 100 : Math.round((sentCount / total) * 10000) / 100; // % (小数2桁)
+
+  return {
+    '年月':     yearMonth,
+    sent_count: usage.sent_count,
+    '到達率':   deliveryRate,
+    '分割通数': usage.sent_count
+  };
+}
+
 
