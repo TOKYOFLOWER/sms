@@ -4,6 +4,30 @@
 
 var SMS_RULES = { SEGMENT: 70, MAX: 660 };
 
+// PLAN_LIMITS: プラン制限の単一情報源（STEP3〜STEP7で共有）。
+//   staffLimit/templateLimit の standard「実質無制限」は大きな整数値で表現。
+//   historyMonths は light=3ヶ月、standard=null（無制限）。
+var PLAN_LIMITS = {
+  light: {
+    dailyLimit:        1000,
+    staffLimit:        3,
+    templateLimit:     5,
+    senderNumberLimit: 1,
+    scheduledSend:     false,
+    historyMonths:     3,
+    freeLimit:         30
+  },
+  standard: {
+    dailyLimit:        3000,
+    staffLimit:        99999,  // 実質無制限
+    templateLimit:     99999,  // 実質無制限
+    senderNumberLimit: 3,
+    scheduledSend:     true,
+    historyMonths:     null,   // 無制限
+    freeLimit:         30
+  }
+};
+
 // 利用権判定: kaihipay_status の有効値（ホワイトリスト）
 // 未知の値を誤って有効にしないよう明示一致のみ有効
 var KAIHI_ACTIVE_VALUES = ['active'];
@@ -224,6 +248,19 @@ function handleSendSmsForm_(body) {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// calcSegments_: 本文のセグメント数(通数)計算の単一情報源。
+//   sendSingleSMSFromForm・STEP4のqueue課金計算・STEP7のフロント文字数
+//   カウンタが同じロジックを共有する。
+//   0文字→0。SMS_RULES.MAX超過→例外（既存のエラーメッセージを踏襲）。
+// ────────────────────────────────────────────────────────────────────
+function calcSegments_(text) {
+  var len = String(text || '').length;
+  if (len === 0) return 0;
+  if (len > SMS_RULES.MAX) throw new Error('本文が長すぎます（上限 ' + SMS_RULES.MAX + '文字）');
+  return Math.ceil(len / SMS_RULES.SEGMENT);
+}
+
+// ────────────────────────────────────────────────────────────────────
 // sendSingleSMSFromForm: CPaaS 送信ロジック本体
 //   doPost(handleSendSms_ / handleSendSmsForm_) および
 //   将来の google.script.run 両方から呼べるよう token を持たない設計
@@ -246,13 +283,11 @@ function sendSingleSMSFromForm(data) {
 
     var text = String(data.message || '').trim();
     if (!text) throw new Error('本文が空です');
-    if (text.length > SMS_RULES.MAX)
-      throw new Error('本文が長すぎます（上限 ' + SMS_RULES.MAX + '文字）');
 
     // 認証情報取得（ログ・レスポンスには出さない）
     var apiKey   = decodeBase64Str_(smsAcc.cpaas_api_key);
     var secret   = decodeBase64Str_(smsAcc.cpaas_secret);
-    var segments = Math.ceil(text.length / SMS_RULES.SEGMENT);
+    var segments = calcSegments_(text); // MAX超過チェックもここで行われる
 
     // CPaaS 認証トークン取得
     var authRes = UrlFetchApp.fetch('https://api.cpaas.symphony.rakuten.net/auth/v1/token', {
@@ -1266,4 +1301,338 @@ function sendInitialPasswordEmail_(email, id, plainPw) {
       '心当たりのない場合はこのメールを無視してください。'
     ].join('\n')
   });
+}
+
+// ────────────────────────────────────────────────────────────────────
+// STEP3: プラン制御・上限・無料枠
+//   tenant 引数は tenants タブの1行分オブジェクト（{tenant_id, plan, status,
+//   trial_end, daily_limit, ...}）。呼び出し元（STEP4以降のqueue処理・
+//   管理画面）は本関数群を通してのみ送信可否・上限判定を行うこと
+//   （判定ロジックの単一情報源化）。
+// ────────────────────────────────────────────────────────────────────
+
+function currentYearMonth_() {
+  return Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMM');
+}
+
+// tenant.plan から PLAN_LIMITS を解決する（未知/空のplanは安全側でlightにフォールバック）
+function getPlanLimits_(tenant) {
+  var plan = tenant && tenant.plan ? String(tenant.plan).trim().toLowerCase() : '';
+  return PLAN_LIMITS[plan] || PLAN_LIMITS.light;
+}
+
+// 当日(JST)の送信済み件数を tenant_id で絞り込んで log タブから数える
+function countTodaySent_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('log');
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  var tenantCol = col['tenant_id'];
+  var dtCol     = col['送信日時'];
+  if (tenantCol === undefined || dtCol === undefined) return 0;
+
+  var todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
+  var count = 0;
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][tenantCol]).trim() !== String(tenantId).trim()) continue;
+    var dtRaw = data[r][dtCol];
+    var dtStr = dtRaw instanceof Date
+      ? Utilities.formatDate(dtRaw, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss')
+      : String(dtRaw || '');
+    if (dtStr.indexOf(todayStr) === 0) count++;
+  }
+  return count;
+}
+
+// usage タブから指定テナント・年月の行を取得する（無ければ null）
+function getUsageRow_(tenantId, yearMonth) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('usage');
+  if (!sheet || sheet.getLastRow() < 2) return null;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['年月'] === undefined) return null;
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (String(data[r][col['年月']]).trim() !== String(yearMonth).trim()) continue;
+    return {
+      free_used:      col['free_used']      !== undefined ? (Number(data[r][col['free_used']])      || 0) : 0,
+      sent_count:     col['sent_count']     !== undefined ? (Number(data[r][col['sent_count']])     || 0) : 0,
+      billable_count: col['billable_count'] !== undefined ? (Number(data[r][col['billable_count']]) || 0) : 0
+    };
+  }
+  return null;
+}
+
+// tenants タブの該当行の status（＋updated_at）を直接更新する内部専用関数。
+//   ADMIN_SECRET不要（管理API updateTenant とは別経路。trial自動遷移など内部ロジック用）。
+function setTenantStatus_(tenantId, status) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet) return false;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['status'] === undefined) return false;
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    sheet.getRange(r + 1, col['status'] + 1).setValue(status);
+    if (col['updated_at'] !== undefined) {
+      sheet.getRange(r + 1, col['updated_at'] + 1).setValue(new Date());
+    }
+    return true;
+  }
+  return false;
+}
+
+// trial → active 自動遷移（冪等）。無料枠(free_used>=freeLimit)またはtrial_end超過で遷移する。
+//   引数のtenantが status='trial' でなければ何もしない。
+//   遷移した場合は tenants タブを更新し、渡された tenant オブジェクトの status も
+//   'active' に書き換える（呼び出し元がそのまま最新状態を参照できるように）。
+function transitionTrialIfNeeded_(tenant) {
+  if (!tenant || String(tenant.status || '').trim().toLowerCase() !== 'trial') return false;
+
+  var limits       = getPlanLimits_(tenant);
+  var usage        = getUsageRow_(tenant.tenant_id, currentYearMonth_()) || { free_used: 0 };
+  var trialEndOver = !!tenant.trial_end && new Date() > new Date(tenant.trial_end);
+  var freeUsedOver = usage.free_used >= limits.freeLimit;
+
+  if (!trialEndOver && !freeUsedOver) return false;
+
+  var updated = setTenantStatus_(tenant.tenant_id, 'active');
+  if (updated) tenant.status = 'active';
+  return updated;
+}
+
+// checkSendAllowed_: 送信可否判定（STEP4のqueue処理から呼ばれる想定）
+//   tenant: tenants タブの1行分オブジェクト、count: 今回送信しようとしている件数
+//   許可できない場合は理由付きで例外をthrowする（doPostの既存エラーハンドリング方針に合わせる）。
+//   戻り値の isFree は今回の送信が無料枠扱いかどうか（STEP4のusage計上で使用）。
+function checkSendAllowed_(tenant, count) {
+  count = Number(count) > 0 ? Number(count) : 1;
+  if (!tenant || !tenant.tenant_id) throw new Error('tenant_not_found');
+
+  var origStatus = String(tenant.status || '').trim().toLowerCase();
+  if (origStatus !== 'trial' && origStatus !== 'active') {
+    throw new Error('tenant_not_active');
+  }
+
+  // trial自動遷移（無料枠超過 or trial_end超過なら active へ）。以後 tenant.status は最新化される。
+  if (origStatus === 'trial') transitionTrialIfNeeded_(tenant);
+
+  // 日次上限チェック（tenant_id='GSD'は既存運用保護のため対象外＝無制限のまま）
+  var limits = getPlanLimits_(tenant);
+  if (String(tenant.tenant_id).trim() !== 'GSD') {
+    var dailyLimit = Number(tenant.daily_limit) > 0 ? Number(tenant.daily_limit) : limits.dailyLimit;
+    var todaySent  = countTodaySent_(tenant.tenant_id);
+    if (todaySent + count > dailyLimit) {
+      throw new Error('daily_limit_exceeded');
+    }
+  }
+
+  // 無料枠判定: transitionTrialIfNeeded_後もまだtrialのまま＝無料枠内・trial_end内
+  var isFree = String(tenant.status || '').trim().toLowerCase() === 'trial';
+
+  return { allowed: true, isFree: isFree, tenant_id: tenant.tenant_id };
+}
+
+// checkStaffLimit_ / checkTemplateLimit_ / checkSenderNumberLimit_:
+//   現在件数がプラン上限未満かどうかを判定する（呼び出し元の実装はSTEP5以降）
+function checkStaffLimit_(tenant, currentStaffCount) {
+  var limits = getPlanLimits_(tenant);
+  return {
+    allowed: Number(currentStaffCount) < limits.staffLimit,
+    limit:   limits.staffLimit,
+    current: Number(currentStaffCount) || 0
+  };
+}
+
+function checkTemplateLimit_(tenant, currentTemplateCount) {
+  var limits = getPlanLimits_(tenant);
+  return {
+    allowed: Number(currentTemplateCount) < limits.templateLimit,
+    limit:   limits.templateLimit,
+    current: Number(currentTemplateCount) || 0
+  };
+}
+
+function checkSenderNumberLimit_(tenant, currentSenderNumberCount) {
+  var limits = getPlanLimits_(tenant);
+  return {
+    allowed: Number(currentSenderNumberCount) < limits.senderNumberLimit,
+    limit:   limits.senderNumberLimit,
+    current: Number(currentSenderNumberCount) || 0
+  };
+}
+
+// checkScheduledSendAllowed_: standardプランのみ予約送信を許可
+function checkScheduledSendAllowed_(tenant) {
+  return getPlanLimits_(tenant).scheduledSend === true;
+}
+
+// getHistoryMonthsLimit_: 履歴閲覧可能な月数（light=3, standard=null=無制限）
+function getHistoryMonthsLimit_(tenant) {
+  return getPlanLimits_(tenant).historyMonths;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// testPlanGuards_: checkSendAllowed_ / transitionTrialIfNeeded_ の自己完結テスト。
+//   実データの tenants/usage は汚さない。検証用に一時テナント行(TEST-PLANGUARD-*)を
+//   自ら作成し、テスト終了時に必ず削除する。GASエディタから手動実行しても、
+//   一時デバッグaction経由で実行しても、戻り値とLoggerに結果が出る。
+// ────────────────────────────────────────────────────────────────────
+function testPlanGuards_() {
+  var results = [];
+  function check(name, expected, actual) {
+    var pass = JSON.stringify(expected) === JSON.stringify(actual);
+    results.push({ case: name, expected: expected, actual: actual, pass: pass });
+    Logger.log((pass ? '[PASS] ' : '[FAIL] ') + name +
+               ' expected=' + JSON.stringify(expected) + ' actual=' + JSON.stringify(actual));
+  }
+
+  // ---- ケース1: status='suspended' → 拒否 ----
+  try {
+    checkSendAllowed_({ tenant_id: 'TEST-PLANGUARD-DUMMY', plan: 'light', status: 'suspended' }, 1);
+    check('1_suspended_rejected', 'tenant_not_active', 'no_throw');
+  } catch (e) {
+    check('1_suspended_rejected', 'tenant_not_active', e.message);
+  }
+
+  // ---- ケース2: 日次上限超過 → 拒否（GSD以外） ----
+  try {
+    checkSendAllowed_({ tenant_id: 'TEST-PLANGUARD-DUMMY', plan: 'light', status: 'active', daily_limit: 5 }, 6);
+    check('2_daily_limit_exceeded', 'daily_limit_exceeded', 'no_throw');
+  } catch (e) {
+    check('2_daily_limit_exceeded', 'daily_limit_exceeded', e.message);
+  }
+
+  // ---- ケース3: 日次上限内 → 許可 ----
+  try {
+    var r3 = checkSendAllowed_({ tenant_id: 'TEST-PLANGUARD-DUMMY', plan: 'light', status: 'active', daily_limit: 5 }, 3);
+    check('3_daily_limit_within', true, r3.allowed === true);
+  } catch (e) {
+    check('3_daily_limit_within', true, 'threw: ' + e.message);
+  }
+
+  // ---- 一時テナント行の準備（trial系の検証は実シート読み書きが必要） ----
+  var ss          = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var tenantSheet = ss.getSheetByName('tenants');
+  var usageSheet  = ss.getSheetByName('usage');
+  var now         = new Date();
+  var ym          = currentYearMonth_();
+  var futureDate  = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  var pastDate    = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  var idFreeOk   = 'TEST-PLANGUARD-FREEOK';
+  var idFreeOver = 'TEST-PLANGUARD-FREEOVER';
+  var idExpired  = 'TEST-PLANGUARD-EXPIRED';
+
+  function appendTestTenant(tenantId, trialEnd) {
+    tenantSheet.appendRow([
+      tenantId, 'TESTカンパニー', 'TEST代表', 'TEST担当', 'tokyoflowerco.ltd@gmail.com',
+      '0000000000', 'TEST住所', 'light', 'trial', now, trialEnd, 30, '', '', 0, now, now
+    ]);
+  }
+  appendTestTenant(idFreeOk, futureDate);
+  appendTestTenant(idFreeOver, futureDate);
+  appendTestTenant(idExpired, pastDate);
+  usageSheet.appendRow([idFreeOver, ym, 0, 30, 0, now]); // free_used=30（上限到達済み）
+
+  // ---- ケース4: trial中でfree_used<30かつtrial_end内 → isFree=true で許可 ----
+  try {
+    var tenant4 = { tenant_id: idFreeOk, plan: 'light', status: 'trial', trial_end: futureDate };
+    var r4 = checkSendAllowed_(tenant4, 1);
+    check('4_trial_free_ok',
+          { allowed: true, isFree: true, statusAfter: 'trial' },
+          { allowed: r4.allowed, isFree: r4.isFree, statusAfter: tenant4.status });
+  } catch (e) {
+    check('4_trial_free_ok', { allowed: true, isFree: true, statusAfter: 'trial' }, 'threw: ' + e.message);
+  }
+
+  // ---- ケース5: free_used>=30 → trial→active自動遷移 & isFree=false ----
+  try {
+    var tenant5 = { tenant_id: idFreeOver, plan: 'light', status: 'trial', trial_end: futureDate };
+    var r5 = checkSendAllowed_(tenant5, 1);
+    var sheetStatus5 = getTenantStatusFromSheet_(idFreeOver);
+    check('5_free_over_transitions',
+          { allowed: true, isFree: false, statusAfter: 'active', sheetStatus: 'active' },
+          { allowed: r5.allowed, isFree: r5.isFree, statusAfter: tenant5.status, sheetStatus: sheetStatus5 });
+  } catch (e) {
+    check('5_free_over_transitions',
+          { allowed: true, isFree: false, statusAfter: 'active', sheetStatus: 'active' }, 'threw: ' + e.message);
+  }
+
+  // ---- ケース6: trial_end超過 → trial→active自動遷移 ----
+  try {
+    var tenant6 = { tenant_id: idExpired, plan: 'light', status: 'trial', trial_end: pastDate };
+    var r6 = checkSendAllowed_(tenant6, 1);
+    var sheetStatus6 = getTenantStatusFromSheet_(idExpired);
+    check('6_trial_end_expired_transitions',
+          { statusAfter: 'active', sheetStatus: 'active' },
+          { statusAfter: tenant6.status, sheetStatus: sheetStatus6 });
+  } catch (e) {
+    check('6_trial_end_expired_transitions', { statusAfter: 'active', sheetStatus: 'active' }, 'threw: ' + e.message);
+  }
+
+  // ---- 後片付け: テスト用tenant/usage行を削除 ----
+  [idFreeOk, idFreeOver, idExpired].forEach(function(id) {
+    deleteTenantRow_(tenantSheet, id);
+  });
+  deleteUsageRow_(usageSheet, idFreeOver, ym);
+
+  var allPass = results.every(function(r) { return r.pass; });
+  Logger.log('[testPlanGuards_] allPass=' + allPass);
+  return { allPass: allPass, results: results };
+}
+
+// tenants シートから指定tenant_idのstatusを読む（テスト検証用）
+function getTenantStatusFromSheet_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  var data  = sheet.getDataRange().getValues();
+  var hdr   = data[0].map(function(h) { return String(h).trim(); });
+  var col   = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() === String(tenantId).trim()) {
+      return String(data[r][col['status']]);
+    }
+  }
+  return null;
+}
+
+// テスト後片付け専用: tenants/usage シートから該当行を削除する
+function deleteTenantRow_(sheet, tenantId) {
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var idCol = hdr.indexOf('tenant_id');
+  if (idCol === -1) return;
+  for (var r = data.length - 1; r >= 1; r--) {
+    if (String(data[r][idCol]).trim() === String(tenantId).trim()) sheet.deleteRow(r + 1);
+  }
+}
+
+function deleteUsageRow_(sheet, tenantId, yearMonth) {
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var idCol = hdr.indexOf('tenant_id');
+  var ymCol = hdr.indexOf('年月');
+  if (idCol === -1 || ymCol === -1) return;
+  for (var r = data.length - 1; r >= 1; r--) {
+    if (String(data[r][idCol]).trim() === String(tenantId).trim() &&
+        String(data[r][ymCol]).trim() === String(yearMonth).trim()) {
+      sheet.deleteRow(r + 1);
+    }
+  }
 }
