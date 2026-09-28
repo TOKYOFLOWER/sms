@@ -4,6 +4,13 @@
 
 var SMS_RULES = { SEGMENT: 70, MAX: 660 };
 
+// フォールバック送信（共通テスト番号での送信元番号pending中の代替送信）関連の定数。
+//   FALLBACK_SEND_PREFIX: 実際に送信する本文の先頭に付与する目印。
+//   FALLBACK_SEND_LIMIT:  1テナントあたりのフォールバック送信の上限回数
+//     （trial無料枠のfree_usedカウンタとは独立。tenants.fallback_send_countで管理）。
+var FALLBACK_SEND_PREFIX = '【テスト送信】';
+var FALLBACK_SEND_LIMIT  = 30;
+
 // PLAN_LIMITS: プラン制限の単一情報源（STEP3〜STEP7で共有）。
 //   staffLimit/templateLimit の standard「実質無制限」は大きな整数値で表現。
 //   historyMonths は light=3ヶ月、standard=null（無制限）。
@@ -73,7 +80,9 @@ var SCHEMA = [
       // STEP7: 申込フォーム(action=signup)で追加投入する項目
       '業種', '想定月間送信数', '紹介元', '規約同意', '特定電子メール法同意',
       // 積み残し2件目: 送信元番号pending中のフォールバック送信元キャッシュ
-      'fallback_sms_account_key'
+      'fallback_sms_account_key',
+      // 積み残し追加分: フォールバック送信回数カウンタ（trial無料枠とは独立）
+      'fallback_send_count'
     ]
   },
   {
@@ -243,19 +252,23 @@ function handleSendSms_(body) {
 
   rateLimitCheck_(id);
 
-  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member);
+  var tenant = resolveTenantForMember_(member);
+  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member, tenant);
   if (!effectiveAccountId) {
     throw new Error('送信元番号の準備中です。しばらくお待ちください');
   }
+  var isFallback = effectiveAccountId !== id;
 
   var result = sendSingleSMSFromForm({
-    accountId:    id,
-    smsAccountId: effectiveAccountId,
-    phoneNumber:  body.to,
-    message:      body.text,
-    countryCode:  '81'
+    accountId:      id,
+    smsAccountId:   effectiveAccountId,
+    phoneNumber:    body.to,
+    message:        body.text,
+    countryCode:    '81',
+    isFallbackSend: isFallback
   });
   if (!result.success) throw new Error(result.message);
+  if (isFallback) incrementFallbackSendCount_(tenant.tenant_id);
   return { segments: result.how_many_message_parts, message: result.result_message };
 }
 
@@ -268,29 +281,38 @@ function handleSendSmsForm_(body) {
     throw new Error('ご契約が有効でないか、送信権限がありません');
   rateLimitCheck_(id);
 
-  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member);
+  var tenant = resolveTenantForMember_(member);
+  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member, tenant);
   if (!effectiveAccountId) {
     throw new Error('送信元番号の準備中です。しばらくお待ちください');
   }
+  var isFallback = effectiveAccountId !== id;
 
   var result = sendSingleSMSFromForm({
-    accountId:    id,
-    smsAccountId: effectiveAccountId,
-    phoneNumber:  body.to,
-    message:      body.text,
-    countryCode:  String(body.countryCode || '81')
+    accountId:      id,
+    smsAccountId:   effectiveAccountId,
+    phoneNumber:    body.to,
+    message:        body.text,
+    countryCode:    String(body.countryCode || '81'),
+    isFallbackSend: isFallback
   });
   if (!result.success) throw new Error(result.message);
+  if (isFallback) incrementFallbackSendCount_(tenant.tenant_id);
   return result;
 }
 
-// resolveEffectiveAccountId_ を例外で落とさず呼び出すラッパー（handleSendSms_/handleSendSmsForm_用）。
-//   途中で何らかのエラーが起きても「準備中」扱いにして安全側に倒す（絶対に例外で落ちないこと）。
-function resolveEffectiveSmsAccountIdSafe_(member) {
+// resolveEffectiveAccountId_ を呼び出すラッパー（handleSendSms_/handleSendSmsForm_用）。
+//   フォールバック上限到達の専用エラー(fallbackSendLimitError_)はそのまま呼び出し元へ
+//   伝える（意図的な業務エラーのため。doPostの既存エラーハンドリング方針に沿ってクリーンに
+//   ok:falseへ変換される）。それ以外の想定外エラーは安全側に倒してnull（「準備中」扱い）にし、
+//   絶対に例外で落ちないようにする。
+function resolveEffectiveSmsAccountIdSafe_(member, tenant) {
   try {
-    var tenant = resolveTenantForMember_(member);
     return resolveEffectiveAccountId_(member, tenant);
   } catch (e) {
+    if (String(e.message || '').indexOf('番号登録完了までお待ちください') === 0) {
+      throw e;
+    }
     Logger.log('[resolveEffectiveSmsAccountIdSafe_] error: ' + e.message);
     return null;
   }
@@ -488,11 +510,15 @@ function calcSegments_(text) {
 //   data.accountIdの代わりにこちらを使う。ログの「会員ID」・logAudit_・
 //   国番号ガードの判定は常にdata.accountId（実際の会員ID）を使い続けるため、
 //   送信履歴(listHistory)の紐付けは一切変わらない。
+//   data.isFallbackSend が true の場合、実際に送信・ログ記録する本文の先頭に
+//   FALLBACK_SEND_PREFIX（【テスト送信】）を付与する。MAX文字数チェック
+//   (calcSegments_)は付与後の文言に対して行われる。
 // ────────────────────────────────────────────────────────────────────
 function sendSingleSMSFromForm(data) {
   var sender       = null;
   var normalizedTo = null;
   var tenantIdForLog = data.tenantId || '';
+  var fallbackPrefix = data.isFallbackSend ? FALLBACK_SEND_PREFIX : '';
   try {
     var smsAcc = getSmsAccount_(data.smsAccountId || data.accountId);
     if (!smsAcc) throw new Error('送信元設定がありません。管理者に連絡してください');
@@ -518,11 +544,12 @@ function sendSingleSMSFromForm(data) {
 
     var text = String(data.message || '').trim();
     if (!text) throw new Error('本文が空です');
+    if (fallbackPrefix) text = fallbackPrefix + text; // フォールバック送信のみ先頭に付与
 
     // 認証情報取得（ログ・レスポンスには出さない）
     var apiKey   = decodeBase64Str_(smsAcc.cpaas_api_key);
     var secret   = decodeBase64Str_(smsAcc.cpaas_secret);
-    var segments = calcSegments_(text); // MAX超過チェックもここで行われる
+    var segments = calcSegments_(text); // MAX超過チェックもここで行われる（プレフィックス込みの文言に対して）
 
     // CPaaS 認証トークン取得
     var authRes = UrlFetchApp.fetch('https://api.cpaas.symphony.rakuten.net/auth/v1/token', {
@@ -598,7 +625,7 @@ function sendSingleSMSFromForm(data) {
       '会員ID': String(data.accountId || ''),
       'from': normalizePhoneFrom_(sender),
       'to': normalizedTo || String(data.phoneNumber || ''),
-      'メッセージ内容': String(data.message || ''),
+      'メッセージ内容': fallbackPrefix + String(data.message || ''),
       'ステータス': 'エラー', 'result_message': e.message,
       'tenant_id': tenantIdForLog, 'batch_id': data.batchId || ''
     });
@@ -1518,28 +1545,33 @@ function processQueue_() {
       }
 
       // 積み残し2件目: 送信元番号pending中は共通テスト番号へフォールバック。
-      // 未設定でnullが返る場合は「準備中」としてfailed確定（リトライしても解決しないため）。
+      // 未設定でnullが返る場合、またはフォールバック送信の上限到達の場合は
+      // failed確定（いずれもリトライしても解決しないため）。
       var effectiveAccountId;
+      var effectiveAccountError = null;
       try {
         effectiveAccountId = resolveEffectiveAccountId_({ id: memberId }, tenant);
       } catch (e) {
         effectiveAccountId = null;
+        effectiveAccountError = e.message;
       }
       if (!effectiveAccountId) {
         sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
-        sheet.getRange(sheetRow, col['result'] + 1).setValue('送信元番号の準備中です。しばらくお待ちください');
+        sheet.getRange(sheetRow, col['result'] + 1).setValue(effectiveAccountError || '送信元番号の準備中です。しばらくお待ちください');
         stats.failed++;
         continue;
       }
+      var isFallback = effectiveAccountId !== memberId;
 
       var sendResult = sendSingleSMSFromForm({
-        accountId:    memberId,
-        smsAccountId: effectiveAccountId,
-        phoneNumber:  to,
-        message:      msgBody,
-        countryCode:  '81', // tenant_id='GSD'以外は81固定。GSD経由のqueue利用は現状想定なし
-        tenantId:     tenantId,
-        batchId:      batchId
+        accountId:      memberId,
+        smsAccountId:   effectiveAccountId,
+        phoneNumber:    to,
+        message:        msgBody,
+        countryCode:    '81', // tenant_id='GSD'以外は81固定。GSD経由のqueue利用は現状想定なし
+        tenantId:       tenantId,
+        batchId:        batchId,
+        isFallbackSend: isFallback
       });
       stats.apiCalls++; // addendum F: usage_system記録用（実際の送信試行回数）
 
@@ -1548,6 +1580,7 @@ function processQueue_() {
         sheet.getRange(sheetRow, col['result'] + 1).setValue(sendResult.result_message || '送信成功');
         sheet.getRange(sheetRow, col['sent_at'] + 1).setValue(new Date());
         stats.sent++;
+        if (isFallback) incrementFallbackSendCount_(tenantId);
 
         var segments = 1;
         try { segments = calcSegments_(msgBody) || 1; } catch (_) { segments = 1; }
@@ -2351,12 +2384,40 @@ function setTenantFallbackSmsAccountKey_(tenantId, key) {
   return false;
 }
 
+// tenantsタブのfallback_send_count列を+1する（フォールバック送信が成功するたびに呼ぶ）
+function incrementFallbackSendCount_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet) return;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['fallback_send_count'] === undefined) return;
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    var current = Number(data[r][col['fallback_send_count']]) || 0;
+    sheet.getRange(r + 1, col['fallback_send_count'] + 1).setValue(current + 1);
+    return;
+  }
+}
+
+// FALLBACK_SEND_LIMIT到達時に投げる専用エラー。メッセージ文字列は呼び出し元
+// (resolveEffectiveSmsAccountIdSafe_)が識別に使うため変更しないこと。
+function fallbackSendLimitError_() {
+  return new Error('番号登録完了までお待ちください（テスト送信の上限に達しました）');
+}
+
 // resolveEffectiveAccountId_: sendSingleSMSFromFormのsmsAccountId解決に使う実効アカウントIDを返す。
 //   ・tenant管理外（GSD含む、tenants未登録）は従来通りmember.idをそのまま返す
 //     （既存動作を一切変えない）。
 //   ・tenant管理下でhasRegisteredSenderNumber_がtrueならmember.idを返す
 //     （自番号。既存の「1会員1送信元(sms_accounts)」の仕組みのまま）。
-//   ・registeredが1件も無い場合、Script Property COMMON_TEST_SENDER_KEY
+//   ・registeredが1件も無い場合、フォールバック送信回数(tenants.fallback_send_count)
+//     がFALLBACK_SEND_LIMIT(30)に達していれば専用エラーをthrowする（上限到達）。
+//     達していなければ Script Property COMMON_TEST_SENDER_KEY
 //     （getPropOptional_で取得。無ければtenant.fallback_sms_account_keyを見る）
 //     を返す。取得できた場合はtenants.fallback_sms_account_key列にキャッシュする。
 //   ・最終的にnullなら「送信元番号の準備中」を意味し、呼び出し元でエラー処理すること。
@@ -2367,6 +2428,11 @@ function resolveEffectiveAccountId_(member, tenant) {
 
   if (hasRegisteredSenderNumber_(tenant.tenant_id)) {
     return member.id; // 自番号（registered済みなのでこの会員のsms_accounts行が用意されている前提）
+  }
+
+  var fallbackCount = Number(tenant.fallback_send_count) || 0;
+  if (fallbackCount >= FALLBACK_SEND_LIMIT) {
+    throw fallbackSendLimitError_();
   }
 
   var commonKey = getPropOptional_('COMMON_TEST_SENDER_KEY') || tenant.fallback_sms_account_key || null;
