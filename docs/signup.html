@@ -66,6 +66,19 @@
 
     .phone-row{display:flex; gap:var(--s2); margin-bottom:var(--s2)}
     .phone-row .input{flex:1}
+    .phone-hint{font-size:12px; margin:-4px 0 var(--s2); color:var(--muted)}
+    .phone-hint.ok{color:var(--brand-strong)}
+    .phone-hint.warn{color:var(--gold)}
+    .phone-hint.err{color:var(--danger)}
+
+    .zip-row{display:flex; gap:var(--s2)}
+    .zip-row .input{flex:1}
+    .btn-zip{
+      flex:none; font:inherit; font-size:13px; color:var(--brand-strong);
+      background:var(--brand-tint); border:1px solid color-mix(in srgb,var(--brand) 35%,transparent);
+      border-radius:var(--r-field); padding:0 var(--s4); cursor:pointer; white-space:nowrap;
+    }
+    .btn-zip:disabled{opacity:.5; cursor:default}
     .btn-icon{
       flex:none; width:44px; min-height:44px; border:1px solid var(--border);
       background:var(--surface-2); border-radius:var(--r-field); cursor:pointer;
@@ -164,23 +177,36 @@
         </div>
         <div class="field">
           <div class="eyebrow">担当者電話 *</div>
-          <input type="tel" id="f-contact-phone" class="input" inputmode="numeric" required>
+          <input type="tel" id="f-contact-phone" class="input" inputmode="numeric" placeholder="0312345678" required>
+          <div class="hint phone-hint" id="contact-phone-hint"></div>
+        </div>
+        <div class="field">
+          <div class="eyebrow">郵便番号 *</div>
+          <div class="zip-row">
+            <input type="text" id="f-zipcode" class="input" inputmode="numeric" placeholder="1040061" maxlength="8" required>
+            <button type="button" id="zip-search-btn" class="btn-zip">住所検索</button>
+          </div>
+          <div class="hint" id="zip-hint">7桁の数字を入力すると自動で住所を検索します（ハイフンは無くても可）。</div>
         </div>
         <div class="field">
           <div class="eyebrow">住所 *</div>
           <input type="text" id="f-address" class="input" required>
+        </div>
+        <div class="field">
+          <div class="eyebrow">住所2（番地・建物名）</div>
+          <input type="text" id="f-address2" class="input" placeholder="例: 1-2-3 〇〇ビル4F">
         </div>
 
         <div class="field">
           <div class="eyebrow">送信元電話番号（1〜3件）*</div>
           <div id="phone-rows"></div>
           <button type="button" id="add-phone-btn" class="btn-add">＋ 送信元電話番号を追加</button>
-          <div class="hint">SMSを送信する電話番号をご入力ください。楽天モバイルへの番号登録手続きに使用します（登録完了まで約2週間かかります）。</div>
+          <div class="hint">SMSを送信する電話番号をご入力ください。当社にて送信元番号の登録手続きを行います（登録完了まで約2週間かかります）。</div>
         </div>
 
         <div class="field">
-          <div class="eyebrow">番号名義 *</div>
-          <input type="text" id="f-number-owner" class="input" required>
+          <div class="eyebrow">送信元番号の契約名義をご入力ください *</div>
+          <input type="text" id="f-number-owner" class="input" placeholder="例: 株式会社東京フラワー" required>
           <div class="hint">送信元電話番号の契約名義です（会社名と同じで構いません）。</div>
         </div>
 
@@ -267,12 +293,107 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('input[name="plan"]').forEach(r => r.addEventListener('change', updatePlanCards));
   updatePlanCards();
   document.getElementById('signupForm').addEventListener('submit', handleSubmit);
+
+  // 郵便番号 → 住所自動入力
+  const zipInput = document.getElementById('f-zipcode');
+  zipInput.addEventListener('input', () => {
+    const digits = zipInput.value.replace(/[^0-9]/g, '');
+    if (digits.length === 7) searchZip();
+  });
+  document.getElementById('zip-search-btn').addEventListener('click', () => searchZip());
+
+  // 担当者電話の桁数リアルタイム表示
+  const contactPhoneInput = document.getElementById('f-contact-phone');
+  const contactPhoneHint  = document.getElementById('contact-phone-hint');
+  contactPhoneInput.addEventListener('input', () => updatePhoneHint(contactPhoneInput, contactPhoneHint, false));
 });
+
+// ── 電話番号の桁数チェック（担当者電話・送信元電話番号 共通） ───────
+//   数字とハイフンのみ許可。ハイフン除去後の桁数が10桁(固定・IP電話)
+//   または11桁(携帯)以外は無効。サーバ側(api.js handleSignup_)にも
+//   同じルールを実装している。
+function isValidPhoneDigits(raw) {
+  const s = String(raw || '').trim();
+  if (!/^[0-9-]+$/.test(s)) return false;
+  const digits = s.replace(/-/g, '');
+  return digits.length === 10 || digits.length === 11;
+}
+
+// 入力中の電話番号欄に残り桁数・✓マーク・警告を表示する。
+// isSender=true の場合、先頭0必須チェックと携帯番号(050/070/080/090)への注意表示も行う。
+function updatePhoneHint(inputEl, hintEl, isSender) {
+  if (!hintEl) return;
+  const raw    = inputEl.value.trim();
+  const digits = raw.replace(/-/g, '').replace(/[^0-9]/g, '');
+
+  if (!raw) { hintEl.textContent = ''; hintEl.className = 'hint phone-hint'; return; }
+
+  if (!/^[0-9-]+$/.test(raw)) {
+    hintEl.textContent = '数字とハイフンのみ入力できます';
+    hintEl.className = 'hint phone-hint err';
+    return;
+  }
+  if (digits.length !== 10 && digits.length !== 11) {
+    const remaining = digits.length < 10 ? (10 - digits.length) : 0;
+    hintEl.textContent = digits.length < 10
+      ? `あと${remaining}桁以上入力してください（10桁または11桁）`
+      : `桁数が多すぎます（10桁または11桁で入力してください。現在${digits.length}桁）`;
+    hintEl.className = 'hint phone-hint err';
+    return;
+  }
+  if (isSender && digits.charAt(0) !== '0') {
+    hintEl.textContent = '送信元電話番号は「0」から始まる番号を入力してください';
+    hintEl.className = 'hint phone-hint err';
+    return;
+  }
+  if (isSender && /^(050|070|080|090)/.test(digits)) {
+    hintEl.textContent = '✓ ' + digits.length + '桁 ／ 送信元には固定電話番号をご登録ください';
+    hintEl.className = 'hint phone-hint warn';
+    return;
+  }
+  hintEl.textContent = '✓ ' + digits.length + '桁';
+  hintEl.className = 'hint phone-hint ok';
+}
+
+// ── 郵便番号検索（ZipCloud API） ──────────────────────────────────
+async function searchZip() {
+  const zipInput = document.getElementById('f-zipcode');
+  const zipHint  = document.getElementById('zip-hint');
+  const digits   = zipInput.value.replace(/[^0-9]/g, '');
+
+  if (digits.length !== 7) {
+    zipHint.textContent = '郵便番号は7桁で入力してください';
+    zipHint.style.color = 'var(--danger)';
+    return;
+  }
+
+  zipHint.textContent = '検索中…';
+  zipHint.style.color = 'var(--muted)';
+  try {
+    const res  = await fetch('https://zipcloud.ibsnet.co.jp/api/search?zipcode=' + digits);
+    const data = await res.json();
+    if (data.status === 200 && data.results && data.results.length) {
+      const r = data.results[0];
+      document.getElementById('f-address').value = (r.address1 || '') + (r.address2 || '') + (r.address3 || '');
+      zipHint.textContent = '住所を自動入力しました。続きの番地・建物名は「住所2」にご入力ください。';
+      zipHint.style.color = 'var(--brand-strong)';
+    } else {
+      zipHint.textContent = '該当する住所が見つかりません。手入力してください';
+      zipHint.style.color = 'var(--danger)';
+    }
+  } catch (err) {
+    // API障害時でも入力・送信は妨げない
+    zipHint.textContent = '住所検索に失敗しました。お手数ですが手入力してください';
+    zipHint.style.color = 'var(--danger)';
+  }
+}
 
 // ── 送信元電話番号の動的行（1〜3件） ─────────────────────────────
 function addPhoneRow() {
   const container = document.getElementById('phone-rows');
   if (container.querySelectorAll('.phone-row').length >= MAX_PHONES) return;
+
+  const wrap = document.createElement('div');
 
   const row = document.createElement('div');
   row.className = 'phone-row';
@@ -280,7 +401,7 @@ function addPhoneRow() {
   const input = document.createElement('input');
   input.type = 'tel';
   input.className = 'input phone-input';
-  input.placeholder = '080xxxxxxxx';
+  input.placeholder = '0312345678';
   input.inputMode = 'numeric';
   row.appendChild(input);
 
@@ -291,12 +412,18 @@ function addPhoneRow() {
   removeBtn.textContent = '✕';
   removeBtn.addEventListener('click', () => {
     if (container.querySelectorAll('.phone-row').length <= 1) return; // 最低1件は残す
-    row.remove();
+    wrap.remove();
     updateAddPhoneBtn();
   });
   row.appendChild(removeBtn);
+  wrap.appendChild(row);
 
-  container.appendChild(row);
+  const hint = document.createElement('div');
+  hint.className = 'hint phone-hint';
+  input.addEventListener('input', () => updatePhoneHint(input, hint, true));
+  wrap.appendChild(hint);
+
+  container.appendChild(wrap);
   updateAddPhoneBtn();
 }
 
@@ -324,6 +451,26 @@ async function handleSubmit(e) {
     .filter(v => v);
   if (!phones.length) { showError('送信元電話番号を1件以上入力してください'); return; }
 
+  // 担当者電話の桁数チェック
+  const contactPhone = document.getElementById('f-contact-phone').value.trim();
+  if (!isValidPhoneDigits(contactPhone)) {
+    showError('担当者電話の桁数が正しくありません（ハイフンを除いた数字が10桁または11桁になるように入力してください）');
+    return;
+  }
+
+  // 送信元電話番号の桁数・先頭0チェック（携帯番号の注意表示は警告のみで送信は妨げない）
+  for (let i = 0; i < phones.length; i++) {
+    const p = phones[i];
+    if (!isValidPhoneDigits(p)) {
+      showError(`送信元電話番号（${i + 1}件目）の桁数が正しくありません（ハイフンを除いた数字が10桁または11桁になるように入力してください）`);
+      return;
+    }
+    if (p.replace(/-/g, '').charAt(0) !== '0') {
+      showError(`送信元電話番号（${i + 1}件目）は「0」から始まる番号をご入力ください`);
+      return;
+    }
+  }
+
   const agreeTerms    = document.getElementById('f-agree-terms').checked;
   const agreeEmailLaw = document.getElementById('f-agree-email-law').checked;
   if (!agreeTerms || !agreeEmailLaw) {
@@ -333,14 +480,20 @@ async function handleSubmit(e) {
 
   const plan = (document.querySelector('input[name="plan"]:checked') || {}).value || 'light';
 
+  // 住所 + 住所2（番地・建物名）を1つの住所欄にまとめて送信する
+  const address1 = document.getElementById('f-address').value.trim();
+  const address2 = document.getElementById('f-address2').value.trim();
+  const fullAddress = address2 ? (address1 + ' ' + address2) : address1;
+
   const payload = {
     action: 'signup',
     '会社名':         document.getElementById('f-company').value.trim(),
     '代表者名':       document.getElementById('f-rep').value.trim(),
     '担当者名':       document.getElementById('f-contact-name').value.trim(),
     '担当者メール':   document.getElementById('f-contact-email').value.trim(),
-    '担当者電話':     document.getElementById('f-contact-phone').value.trim(),
-    '住所':           document.getElementById('f-address').value.trim(),
+    '担当者電話':     contactPhone,
+    '郵便番号':       document.getElementById('f-zipcode').value.trim(),
+    '住所':           fullAddress,
     '送信元電話番号': phones,
     '番号名義':       document.getElementById('f-number-owner').value.trim(),
     'plan':           plan,
