@@ -2694,4 +2694,21 @@ function sendSignupAdminNotifyEmail_(info) {
   });
 }
 
+// ────────────────────────────────────────────────────────────────────
+// authorizeOnce: Apps Script エディタから手動実行するための公開ラッパー。
+//   末尾が _ の関数はエディタの実行対象関数一覧に出ないため、初回のみ
+//   デプロイユーザー(tokyoflower)がここでDrive/Scriptの権限許可を行う目的で
+//   用意する。backupSpreadsheet_ → ensureTriggers_ の順に呼び、結果をLoggerに
+//   出力する。以後は不要（通常運用ではsetupアクション経由で呼ばれる）。
+// ────────────────────────────────────────────────────────────────────
+function authorizeOnce() {
+  var backupResult = backupSpreadsheet_();
+  Logger.log('[authorizeOnce] backupSpreadsheet_ 完了: ' + JSON.stringify(backupResult));
+
+  var triggerResult = ensureTriggers_();
+  Logger.log('[authorizeOnce] ensureTriggers_ 完了: ' + JSON.stringify(triggerResult));
+
+  Logger.log('[authorizeOnce] 権限許可の確認が完了しました。');
+}
+
 
