@@ -1094,12 +1094,14 @@ function handleListHistory_(body) {
 //   ・シートがあればヘッダー行を読み取り、不足している列だけを末尾に追加
 //   ・既存列の内容・順序は一切変更しない
 //   ・会員マスタ(api_key)への tenant_id="GSD" / tenant_role="owner" デフォルト投入も実施
+//   ・logタブの過去行(tenant_id空欄)への "GSD" バックフィルも実施
 // ────────────────────────────────────────────────────────────────────
 function ensureSchema_() {
   var report = SCHEMA.map(function(entry) {
     return ensureSheetSchema_(entry);
   });
   report.push(ensureMemberDefaults_());
+  report.push(backfillLogTenantId_());
   return report;
 }
 
@@ -1223,6 +1225,44 @@ function ensureMemberDefaults_() {
   };
 }
 
+// logタブの既存行のうちtenant_idが空欄の行にのみ'GSD'を投入する（冪等・ensureMemberDefaults_と同じ思想）。
+//   STEP4aでappendSmsLog_がtenant_id/batch_idを実際に書き込むようになる前の過去ログ行は
+//   tenant_idが空欄のままで、exportHistory/monthlyReport/countTodaySent_のtenant_id
+//   フィルタから漏れてしまう。過去分はすべてGSD運用（tenant_id='GSD'固定）だったことが
+//   自明なため、空欄の行にのみバックフィルする。既に値がある行（STEP4a以降の新規行）は
+//   上書きしない。batch_idは元々存在しない情報のため空欄のままにする。
+function backfillLogTenantId_() {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('log');
+  if (!sheet) return { tab: 'log', action: 'skipped_missing' };
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { tab: 'log', action: 'no_data_rows' };
+
+  var lastCol = sheet.getLastColumn();
+  var norm    = function(h) { return String(h).normalize('NFKC').trim(); };
+  var hdr     = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(norm);
+  var tenantCol = hdr.indexOf('tenant_id');
+  if (tenantCol === -1) return { tab: 'log', action: 'column_missing' };
+
+  var dataRows   = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  var tenantVals = [];
+  var filled     = 0;
+
+  for (var r = 0; r < dataRows.length; r++) {
+    var v = String(dataRows[r][tenantCol] || '').trim();
+    if (v) {
+      tenantVals.push([dataRows[r][tenantCol]]);
+    } else {
+      tenantVals.push(['GSD']);
+      filled++;
+    }
+  }
+  sheet.getRange(2, tenantCol + 1, tenantVals.length, 1).setValues(tenantVals);
+
+  return { tab: 'log', action: 'backfilled', dataRows: dataRows.length, tenantIdFilled: filled };
+}
+
 // ────────────────────────────────────────────────────────────────────
 // backupSpreadsheet_: MASTER_SHEET_ID / SMS_SHEET_ID をそれぞれ Drive 上にコピー
 //   ファイル名: sms_backup_master_YYYYMMDD / sms_backup_sms_YYYYMMDD
@@ -1336,6 +1376,15 @@ function ensureTriggers_() {
     created.push('dailyResetCheck_ (毎日 00:05 JST)');
   }
 
+  // addendum G: ログアーカイブ（月次、closeMonth_と同じタイミング）
+  if (existingFns['archiveLog_']) {
+    skipped.push('archiveLog_');
+  } else {
+    ScriptApp.newTrigger('archiveLog_').timeBased()
+      .onMonthDay(1).atHour(2).nearMinute(0).inTimezone('Asia/Tokyo').create();
+    created.push('archiveLog_ (毎月1日 02:00 JST)');
+  }
+
   return { created: created, skipped: skipped };
 }
 
@@ -1356,7 +1405,7 @@ function processQueue_() {
   var startTime      = Date.now();
   var MAX_RUNTIME_MS = 4 * 60 * 1000; // 4分
   var MAX_ROWS        = 200;
-  var stats = { processed: 0, sent: 0, failed: 0, retried: 0, truncated: false, elapsedMs: 0 };
+  var stats = { processed: 0, sent: 0, failed: 0, retried: 0, truncated: false, elapsedMs: 0, apiCalls: 0 };
 
   try {
     var sheet   = getQueueSheet_();
@@ -1430,6 +1479,7 @@ function processQueue_() {
         tenantId:    tenantId,
         batchId:     batchId
       });
+      stats.apiCalls++; // addendum F: usage_system記録用（実際の送信試行回数）
 
       if (sendResult.success) {
         sheet.getRange(sheetRow, col['status'] + 1).setValue('sent');
@@ -1459,11 +1509,58 @@ function processQueue_() {
     stats.error = err.message;
   } finally {
     lock.releaseLock();
+    // addendum F: 実行末尾でusage_systemタブに当日のapi_calls/mail_quota_remainingを記録
+    try {
+      var dateKey = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
+      recordUsageSystem_(dateKey, stats.apiCalls, MailApp.getRemainingDailyQuota());
+    } catch (e2) {
+      Logger.log('[processQueue_] recordUsageSystem_ error: ' + e2.message);
+    }
   }
 
   stats.elapsedMs = Date.now() - startTime;
   Logger.log('[processQueue_] ' + JSON.stringify(stats));
   return stats;
+}
+
+// usage_systemタブへの日次記録（addendum F）。dateKey（例:'yyyy/MM/dd'）をキーに
+//   該当行を作成/更新する。api_calls はその日の累計に apiCallsDelta を加算し、
+//   mail_quota_remaining は呼び出し時点のMailApp残クォータで上書きする。
+function recordUsageSystem_(dateKey, apiCallsDelta, mailQuotaRemaining) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('usage_system');
+  if (!sheet) return;
+
+  var lastRow = sheet.getLastRow();
+  var hdr = lastRow >= 1
+    ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) { return String(h).trim(); })
+    : [];
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['日付'] === undefined) return;
+
+  var data = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues() : [];
+  for (var r = 0; r < data.length; r++) {
+    if (String(data[r][col['日付']]).trim() !== String(dateKey).trim()) continue;
+    var sheetRow = r + 2;
+    if (col['api_calls'] !== undefined) {
+      var newApiCalls = (Number(data[r][col['api_calls']]) || 0) + (Number(apiCallsDelta) || 0);
+      sheet.getRange(sheetRow, col['api_calls'] + 1).setValue(newApiCalls);
+    }
+    if (col['mail_quota_remaining'] !== undefined) {
+      sheet.getRange(sheetRow, col['mail_quota_remaining'] + 1).setValue(mailQuotaRemaining);
+    }
+    return;
+  }
+
+  // 該当日の行が無ければ新規作成
+  var newRow = hdr.map(function(h) {
+    if (h === '日付')                 return dateKey;
+    if (h === 'api_calls')            return Number(apiCallsDelta) || 0;
+    if (h === 'mail_quota_remaining') return mailQuotaRemaining;
+    return '';
+  });
+  sheet.appendRow(newRow);
 }
 
 // TODO: STEP6で実装予定（月次締め: usage集計→invoices確定・請求処理）
@@ -1476,6 +1573,36 @@ function closeMonth_() {
 // 現時点ではno-op stub（トリガー動作確認用）。
 function dailyResetCheck_() {
   Logger.log('[dailyResetCheck_] STEP3未実装のため no-op');
+}
+
+// addendum G: ログアーカイブ（月次トリガーから呼ばれる想定）。
+//   TODO(将来の本実装): logタブの行数が閾値を超えたら、年月別の新規タブ
+//     （例: 'log_202609'）を作成し、古い行をそちらへ移動する。
+//     - アーカイブ対象の判定は「送信日時」列を基準に月単位で区切る。
+//     - 移動後は元のlogタブから該当行を削除し、tenant_id/batch_id等の
+//       追加列も含めてヘッダーごとコピーする（appendSmsLog_と同じ列構成）。
+//     - 大量行のバッチ削除はGASの実行時間制限に注意し、
+//       processQueue_同様に複数回のトリガー実行に分割する設計にすること。
+//   現時点では上記の本実装は行わず、閾値判定とログ警告のみの安全なno-opとする。
+function archiveLog_() {
+  var ARCHIVE_THRESHOLD_ROWS = 500000;
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('log');
+  if (!sheet) {
+    Logger.log('[archiveLog_] logタブが見つかりません。no-op。');
+    return { action: 'noop', reason: 'log_sheet_missing' };
+  }
+
+  var rowCount = Math.max(sheet.getLastRow() - 1, 0); // ヘッダー除く
+  if (rowCount < ARCHIVE_THRESHOLD_ROWS) {
+    Logger.log('[archiveLog_] 行数(' + rowCount + ')が閾値(' + ARCHIVE_THRESHOLD_ROWS + ')未満のため no-op。');
+    return { action: 'noop', rowCount: rowCount, threshold: ARCHIVE_THRESHOLD_ROWS };
+  }
+
+  // 閾値超過: 本実装(年月別タブへの移動)は未実装のため警告のみ出す。
+  Logger.log('[archiveLog_] WARN: logタブの行数(' + rowCount + ')が閾値(' + ARCHIVE_THRESHOLD_ROWS
+    + ')を超えています。アーカイブ本実装が必要です（現状は警告のみでアーカイブは実行されません）。');
+  return { action: 'warn_threshold_exceeded', rowCount: rowCount, threshold: ARCHIVE_THRESHOLD_ROWS };
 }
 
 // listTenants: tenants タブの全行をオブジェクト配列で返す
@@ -1644,7 +1771,21 @@ function generateInitialPassword_() {
   return Utilities.getUuid().replace(/-/g, '').substring(0, 12);
 }
 
+// addendum F: メール送信前のクォータガード。残り10通未満なら true（=送信を見送るべき）。
+//   OTP送信(sendOtpEmail_)はログイン導線の生命線のため対象外とし、それ以外
+//   （初期パスワード発行・申込受付・管理者通知）のメールにのみ適用する。
+//   true の場合は呼び出し元が実送信をスキップしLogger.logに記録する
+//   （キュー化・翌日再送の仕組みは今回のスコープ外。まずは記録のみで十分と判断）。
+function checkMailQuota_() {
+  return MailApp.getRemainingDailyQuota() < 10;
+}
+
 function sendInitialPasswordEmail_(email, id, plainPw) {
+  if (checkMailQuota_()) {
+    Logger.log('[sendInitialPasswordEmail_] メール送信不可(クォータ残少)のため送信をスキップしました。'
+      + '翌日以降に管理者が確認・対応してください。 email=' + email + ' id=' + id);
+    return;
+  }
   // 平文パスワードはメール本文のみ。ログ・レスポンスには一切出さない。
   MailApp.sendEmail({
     to:      email,
@@ -2494,6 +2635,11 @@ function endOfMonthJst_(baseDate) {
 }
 
 function sendSignupConfirmationEmail_(email, companyName, plan, numbers) {
+  if (checkMailQuota_()) {
+    Logger.log('[sendSignupConfirmationEmail_] メール送信不可(クォータ残少)のため送信をスキップしました。'
+      + '翌日以降に管理者が確認・対応してください。 email=' + email + ' companyName=' + companyName);
+    return;
+  }
   var planLabel  = plan === 'standard' ? 'standard（スタンダード）' : 'light（ライト）';
   var numberList = numbers.map(function(n) { return '　・' + n; }).join('\n');
   MailApp.sendEmail({
@@ -2520,6 +2666,11 @@ function sendSignupConfirmationEmail_(email, companyName, plan, numbers) {
 
 // TF管理者への通知メール（楽天モバイルへの番号登録申請にそのまま使える形式で整形）
 function sendSignupAdminNotifyEmail_(info) {
+  if (checkMailQuota_()) {
+    Logger.log('[sendSignupAdminNotifyEmail_] メール送信不可(クォータ残少)のため送信をスキップしました。'
+      + '翌日以降に管理者が確認・対応してください。 tenant_id=' + info.tenantId + ' companyName=' + info.companyName);
+    return;
+  }
   var adminEmail = getPropOptional_('ADMIN_NOTIFY_EMAIL') || 'tokyoflowerco.ltd@gmail.com';
   var numberList = info.numbers.map(function(n, i) { return (i + 1) + '. ' + n; }).join('\n');
   MailApp.sendEmail({
