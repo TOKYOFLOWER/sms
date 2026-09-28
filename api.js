@@ -99,6 +99,16 @@ function doPost(e) {
       case 'sendSmsForm':          result = handleSendSmsForm_(body);          break;
       case 'listHistory':          result = handleListHistory_(body);          break;
       case 'ping':                 result = handlePing_(body);                 break;
+
+      // ---- STEP2: 管理API（すべて requireAdmin_ で ADMIN_SECRET 必須。bootstrapAdminのみ例外） ----
+      case 'bootstrapAdmin':       result = handleBootstrapAdmin_(body);       break;
+      case 'setup':                result = handleAdminSetup_(body);           break;
+      case 'listTriggers':         result = handleListTriggers_(body);         break;
+      case 'listTenants':          result = handleListTenants_(body);          break;
+      case 'updateTenant':         result = handleUpdateTenant_(body);         break;
+      case 'updateSenderNumber':   result = handleUpdateSenderNumber_(body);   break;
+      case 'issueAccount':         result = handleIssueAccount_(body);         break;
+
       default: throw new Error('unknown action: ' + action);
     }
     return json_({ ok: true, result: result });
@@ -990,4 +1000,270 @@ function backupSpreadsheet_() {
   Logger.log('[backupSpreadsheet_] master backup id: ' + result.masterBackupId);
   Logger.log('[backupSpreadsheet_] sms backup id: '    + result.smsBackupId);
   return result;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// STEP2: 管理API・セットアップ
+//   ・ADMIN_SECRET は Script Properties に保存する共有シークレット。
+//     bootstrapAdmin で一度だけ生成し、以後の管理系actionは全て
+//     requireAdmin_(body) で body.admin_secret と照合する。
+//   ・GAS の doPost は常に HTTP 200 を返す制約があるため、「403相当」は
+//     レスポンスJSON内 { ok:false, error:'forbidden' } として表現する
+//     （このファイルの既存のエラーハンドリング方針を踏襲）。
+// ────────────────────────────────────────────────────────────────────
+
+// Script Properties を未設定でも例外を投げずに取得する（getProp_ は未設定だと例外を投げるため別関数にする）
+function getPropOptional_(key) {
+  return PropertiesService.getScriptProperties().getProperty(key);
+}
+
+// bootstrapAdmin: ADMIN_SECRET が未設定の場合のみ生成・保存する（二重初期化防止）
+//   値は絶対にレスポンス・ログへ出力しない。保存できた事実のみ返す。
+function handleBootstrapAdmin_(body) {
+  var sp = PropertiesService.getScriptProperties();
+  if (sp.getProperty('ADMIN_SECRET')) {
+    throw new Error('forbidden: ADMIN_SECRET は既に初期化済みです');
+  }
+  var secret = Utilities.getUuid() + Utilities.getUuid(); // 256bit相当
+  sp.setProperty('ADMIN_SECRET', secret);
+  return { ok: true, initialized: true };
+}
+
+// 管理系action共通ガード: body.admin_secret を ADMIN_SECRET と固定時間比較
+function requireAdmin_(body) {
+  var adminSecret = getPropOptional_('ADMIN_SECRET');
+  if (!adminSecret) throw new Error('forbidden: ADMIN_SECRET未設定です。bootstrapAdminを先に実行してください');
+  var given = String((body && body.admin_secret) || '');
+  if (!given || !safeEqual_(adminSecret, given)) throw new Error('forbidden');
+}
+
+// setup: backupSpreadsheet_ → ensureSchema_ → トリガー作成（すべて冪等）
+function handleAdminSetup_(body) {
+  requireAdmin_(body);
+  var backup   = backupSpreadsheet_();
+  var schema   = ensureSchema_();
+  var triggers = ensureTriggers_();
+  return { backup: backup, schema: schema, triggers: triggers };
+}
+
+// listTriggers: 現在のプロジェクトトリガー一覧（確認用）
+function handleListTriggers_(body) {
+  requireAdmin_(body);
+  return ScriptApp.getProjectTriggers().map(function(t) {
+    return {
+      handlerFunction: t.getHandlerFunction(),
+      eventType:       String(t.getEventType()),
+      triggerSource:   String(t.getTriggerSource())
+    };
+  });
+}
+
+// インストール型トリガーを冪等に作成する（同名関数のトリガーが既にあればスキップ）
+//   ※ トリガーはプロジェクトのHEAD（最新push）に対して発火するため、
+//     本番運用開始前にこれを実行してはならない（呼び出し元のsetupはADMIN_SECRET必須）。
+function ensureTriggers_() {
+  var existing    = ScriptApp.getProjectTriggers();
+  var existingFns = {};
+  existing.forEach(function(t) { existingFns[t.getHandlerFunction()] = true; });
+
+  var created = [];
+  var skipped = [];
+
+  if (existingFns['processQueue_']) {
+    skipped.push('processQueue_');
+  } else {
+    ScriptApp.newTrigger('processQueue_').timeBased().everyMinutes(5).create();
+    created.push('processQueue_ (5分毎)');
+  }
+
+  if (existingFns['closeMonth_']) {
+    skipped.push('closeMonth_');
+  } else {
+    ScriptApp.newTrigger('closeMonth_').timeBased()
+      .onMonthDay(1).atHour(2).nearMinute(0).inTimezone('Asia/Tokyo').create();
+    created.push('closeMonth_ (毎月1日 02:00 JST)');
+  }
+
+  if (existingFns['dailyResetCheck_']) {
+    skipped.push('dailyResetCheck_');
+  } else {
+    ScriptApp.newTrigger('dailyResetCheck_').timeBased()
+      .everyDays(1).atHour(0).nearMinute(5).inTimezone('Asia/Tokyo').create();
+    created.push('dailyResetCheck_ (毎日 00:05 JST)');
+  }
+
+  return { created: created, skipped: skipped };
+}
+
+// TODO: STEP4で実装予定（queueタブから送信待ちレコードを取り出しSMS送信する本体）
+// 現時点ではno-op stub（トリガー動作確認用）。
+function processQueue_() {
+  Logger.log('[processQueue_] STEP4未実装のため no-op');
+}
+
+// TODO: STEP6で実装予定（月次締め: usage集計→invoices確定・請求処理）
+// 現時点ではno-op stub（トリガー動作確認用）。
+function closeMonth_() {
+  Logger.log('[closeMonth_] STEP6未実装のため no-op');
+}
+
+// TODO: STEP3で実装予定（trial_end超過等のテナントstatus日次遷移チェック）
+// 現時点ではno-op stub（トリガー動作確認用）。
+function dailyResetCheck_() {
+  Logger.log('[dailyResetCheck_] STEP3未実装のため no-op');
+}
+
+// listTenants: tenants タブの全行をオブジェクト配列で返す
+function handleListTenants_(body) {
+  requireAdmin_(body);
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet || sheet.getLastRow() < 2) return { tenants: [] };
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var tenants = [];
+  for (var r = 1; r < data.length; r++) {
+    var obj = {};
+    hdr.forEach(function(h, i) { obj[h] = data[r][i]; });
+    tenants.push(obj);
+  }
+  return { tenants: tenants };
+}
+
+// updateTenant: tenants タブの該当行の plan/status（指定があれば）と updated_at を更新
+function handleUpdateTenant_(body) {
+  requireAdmin_(body);
+  var tenantId = String(body.tenant_id || '').trim();
+  if (!tenantId) throw new Error('tenant_id は必須です');
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet) throw new Error('tenants タブが存在しません');
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined) throw new Error('tenants タブに tenant_id 列がありません');
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== tenantId) continue;
+
+    if (body.plan !== undefined && col['plan'] !== undefined) {
+      sheet.getRange(r + 1, col['plan'] + 1).setValue(body.plan);
+    }
+    if (body.status !== undefined && col['status'] !== undefined) {
+      sheet.getRange(r + 1, col['status'] + 1).setValue(body.status);
+    }
+    if (col['updated_at'] !== undefined) {
+      sheet.getRange(r + 1, col['updated_at'] + 1).setValue(new Date());
+    }
+    return { tenant_id: tenantId, updated: true };
+  }
+  throw new Error('tenant_id が見つかりません: ' + tenantId);
+}
+
+// updateSenderNumber: sender_numbers タブの該当行(tenant_id + 電話番号 で特定)を更新
+//   ※ 電話番号列は setNumberFormat('@') 済みでもシート書き込み経路によっては数値化され
+//     先頭0が失われることがある（sendSingleSMSFromForm の from 列と同じ既知の事象）。
+//     そのため比較は normalizePhoneFrom_ で先頭0付き国内形式に揃えてから行う。
+function handleUpdateSenderNumber_(body) {
+  requireAdmin_(body);
+  var tenantId = String(body.tenant_id || '').trim();
+  var phone    = normalizePhoneFrom_(body['電話番号'] || body.phone || '');
+  if (!tenantId || !phone) throw new Error('tenant_id と 電話番号 は必須です');
+
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('sender_numbers');
+  if (!sheet) throw new Error('sender_numbers タブが存在しません');
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['電話番号'] === undefined) {
+    throw new Error('sender_numbers タブに tenant_id / 電話番号 列がありません');
+  }
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== tenantId) continue;
+    if (normalizePhoneFrom_(data[r][col['電話番号']]) !== phone) continue;
+
+    if (body.status !== undefined && col['status'] !== undefined) {
+      sheet.getRange(r + 1, col['status'] + 1).setValue(body.status);
+    }
+    if (body.sms_account_key !== undefined && col['sms_account_key'] !== undefined) {
+      sheet.getRange(r + 1, col['sms_account_key'] + 1).setValue(body.sms_account_key);
+    }
+    return { tenant_id: tenantId, phone: phone, updated: true };
+  }
+  throw new Error('該当する sender_number が見つかりません（tenant_id/電話番号を確認してください）');
+}
+
+// issueAccount: 会員マスタ(api_key, MASTER_SHEET_ID)に新規会員行を作成し、
+//   初期パスワードを発行して担当者メールへ送信する。
+//   既存の pw 格納形式（'BASE64:' プレフィックス付きBase64、decodeBase64Str_ が復号）に合わせる。
+function handleIssueAccount_(body) {
+  requireAdmin_(body);
+  var tenantId = String(body.tenant_id || '').trim();
+  var id       = String(body.id || '').trim();
+  var email    = String(body.email || '').trim();
+  if (!tenantId || !id || !email) throw new Error('tenant_id / id / email は必須です');
+  if (getMember_(id)) throw new Error('id が既に存在します: ' + id);
+
+  var ss    = SpreadsheetApp.openById(getProp_('MASTER_SHEET_ID'));
+  var sheet = ss.getSheetByName('api_key');
+  if (!sheet) throw new Error('api_key タブが存在しません');
+
+  var lastCol = sheet.getLastColumn();
+  var hdr     = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
+                  .map(function(h) { return String(h).normalize('NFKC').trim(); });
+
+  var plainPw   = generateInitialPassword_();
+  var encodedPw = 'BASE64:' + Utilities.base64Encode(plainPw);
+
+  // 会員マスタは複数サービス共有シートのため、STEP2が把握している列名にのみ値を入れ、
+  // それ以外の既存列（他サービス用）は空欄のまま追加する。
+  var values = {
+    id:               id,
+    pw:               encodedPw,
+    email:            email,
+    kaihipay_status:  String(body.kaihipay_status || 'active'),
+    tenant_id:        tenantId,
+    tenant_role:      'owner',
+    contact_name:     String(body.contact_name || '')
+  };
+
+  var row = hdr.map(function(h) {
+    return values.hasOwnProperty(h) ? values[h] : '';
+  });
+  sheet.appendRow(row);
+
+  sendInitialPasswordEmail_(email, id, plainPw);
+  logAudit_('admin', 'issueAccount', id, 'ok: tenant=' + tenantId);
+
+  return { id: id, tenant_id: tenantId, email: email };
+}
+
+// 初期パスワード生成（UUIDから記号を除いた英数字12文字）
+function generateInitialPassword_() {
+  return Utilities.getUuid().replace(/-/g, '').substring(0, 12);
+}
+
+function sendInitialPasswordEmail_(email, id, plainPw) {
+  // 平文パスワードはメール本文のみ。ログ・レスポンスには一切出さない。
+  MailApp.sendEmail({
+    to:      email,
+    subject: '【SMS送信侍】アカウント発行のお知らせ',
+    body:    [
+      'アカウントを発行しました。',
+      '',
+      'ログインID: ' + id,
+      '初期パスワード: ' + plainPw,
+      '',
+      '初回ログイン後、お早めにパスワードの変更をご検討ください。',
+      '心当たりのない場合はこのメールを無視してください。'
+    ].join('\n')
+  });
 }
