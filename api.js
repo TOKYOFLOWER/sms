@@ -69,7 +69,9 @@ var SCHEMA = [
     headers: [
       'tenant_id', '会社名', '代表者名', '担当者名', '担当者メール', '担当者電話', '住所',
       'plan', 'status', '申込日', 'trial_end', 'trial_free_limit',
-      'fincode_customer_id', 'fincode_card_id', 'daily_limit', 'created_at', 'updated_at'
+      'fincode_customer_id', 'fincode_card_id', 'daily_limit', 'created_at', 'updated_at',
+      // STEP7: 申込フォーム(action=signup)で追加投入する項目
+      '業種', '想定月間送信数', '紹介元', '規約同意', '特定電子メール法同意'
     ]
   },
   {
@@ -124,6 +126,9 @@ function doPost(e) {
       case 'bulkSend':              result = handleBulkSend_(body);             break;
       case 'listHistory':          result = handleListHistory_(body);          break;
       case 'ping':                 result = handlePing_(body);                 break;
+
+      // ---- STEP7a: 申込フォームAPI（token不要・公開エンドポイント） ----
+      case 'signup':               result = handleSignup_(body);               break;
 
       // ---- STEP5a: テンプレート・送信元番号・履歴エクスポート・月次レポート（すべてtoken必須） ----
       case 'listTemplates':        result = handleListTemplates_(body);        break;
@@ -1992,6 +1997,16 @@ function appendRowByHeaderNames_(sheet, valuesByName) {
   sheet.appendRow(row);
 }
 
+// 数字だけの文字列がシート書き込み時に数値化され先頭0を失うのを防ぐ。
+//   setNumberFormat('@') 済みの列でも appendRow/setValues 経由だと数値化されることが
+//   ある（STEP2で判明した既知の事象）ため、電話番号等を書き込む前に必ずこれを通す。
+//   先頭にアポストロフィを付けるとSheetsはテキスト強制として扱い、実際の値には
+//   アポストロフィは含まれない（手動入力で '0312345678 と打つのと同じ挙動）。
+function forceTextValue_(v) {
+  var s = String(v || '');
+  return /^\d+$/.test(s) ? ("'" + s) : s;
+}
+
 // ── テンプレートCRUD ──────────────────────────────────────────────
 
 function countTemplatesForTenant_(tenantId) {
@@ -2294,6 +2309,180 @@ function handleMonthlyReport_(body) {
     '到達率':   deliveryRate,
     '分割通数': usage.sent_count
   };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// STEP7a: 申込フォームAPI（バックエンド）。action=signup は token不要の公開
+// エンドポイント（未契約の見込み客が呼ぶため）。
+//   1. 必須項目・plan値・規約同意チェック
+//   2. tenant_id発行 → tenants タブへ1行追加（status='pending_number'）
+//   3. sender_numbers タブへ送信元電話番号ごとに1行追加（status='pending'）
+//   4. 担当者へ受付メール、TF管理者へ番号登録依頼メールを送信
+// ────────────────────────────────────────────────────────────────────
+function handleSignup_(body) {
+  var companyName    = String(body['会社名'] || '').trim();
+  var repName         = String(body['代表者名'] || '').trim();
+  var contactName      = String(body['担当者名'] || '').trim();
+  var contactEmail    = String(body['担当者メール'] || '').trim();
+  var contactPhone    = String(body['担当者電話'] || '').trim();
+  var address         = String(body['住所'] || '').trim();
+  var senderNumbersRaw = Array.isArray(body['送信元電話番号']) ? body['送信元電話番号'] : [];
+  var numberOwner     = String(body['番号名義'] || '').trim();
+  var plan             = String(body['plan'] || '').trim().toLowerCase();
+  var industry        = String(body['業種'] || '').trim();
+  var monthlyVolume   = body['想定月間送信数'] !== undefined && body['想定月間送信数'] !== null
+                          ? String(body['想定月間送信数']).trim() : '';
+  var referral        = String(body['紹介元'] || '').trim();
+  var agreeTerms      = body['規約同意'] === true;
+  var agreeEmailLaw   = body['特定電子メール法同意'] === true;
+
+  // 1. 必須項目チェック
+  var missing = [];
+  if (!companyName) missing.push('会社名');
+  if (!repName) missing.push('代表者名');
+  if (!contactName) missing.push('担当者名');
+  if (!contactEmail) missing.push('担当者メール');
+  if (!contactPhone) missing.push('担当者電話');
+  if (!address) missing.push('住所');
+  if (!senderNumbersRaw.length) missing.push('送信元電話番号（1件以上）');
+  if (!numberOwner) missing.push('番号名義');
+  if (!plan) missing.push('plan');
+  if (missing.length) {
+    throw new Error('未入力の項目があります: ' + missing.join('、'));
+  }
+  if (['light', 'standard'].indexOf(plan) === -1) {
+    throw new Error('plan は light または standard を指定してください');
+  }
+  if (senderNumbersRaw.length > 3) {
+    throw new Error('送信元電話番号は最大3件までです');
+  }
+  if (!agreeTerms) throw new Error('利用規約への同意が必要です');
+  if (!agreeEmailLaw) throw new Error('特定電子メール法に基づく表示への同意が必要です');
+
+  var normalizedNumbers = senderNumbersRaw
+    .map(function(n) { return normalizePhoneFrom_(n); })
+    .filter(function(n) { return n; });
+  if (!normalizedNumbers.length) throw new Error('有効な送信元電話番号がありません');
+
+  // 2. tenant_id発行 → tenants タブへ追加
+  var tenantId = generateTenantId_();
+  var now      = new Date();
+  var trialEnd = endOfMonthJst_(now);
+  var limits   = PLAN_LIMITS[plan];
+
+  var ss          = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var tenantSheet = ss.getSheetByName('tenants');
+  if (!tenantSheet) throw new Error('tenants タブが存在しません');
+
+  appendRowByHeaderNames_(tenantSheet, {
+    tenant_id: tenantId,
+    '会社名': companyName, '代表者名': repName, '担当者名': contactName,
+    '担当者メール': contactEmail, '担当者電話': contactPhone, '住所': address,
+    plan: plan, status: 'pending_number', '申込日': now,
+    trial_end: trialEnd, trial_free_limit: limits.freeLimit,
+    daily_limit: limits.dailyLimit,
+    created_at: now, updated_at: now,
+    '業種': industry, '想定月間送信数': monthlyVolume, '紹介元': referral,
+    '規約同意': true, '特定電子メール法同意': true
+  });
+
+  // 3. sender_numbers タブへ番号ごとに1行追加
+  //    ※ 電話番号は setNumberFormat('@') 済みの列でも appendRow 経由だと数値化され
+  //      先頭0が失われることがある（STEP2で判明した既知の事象）ため、
+  //      forceTextValue_ でテキスト強制してから書き込む。
+  var senderSheet = ss.getSheetByName('sender_numbers');
+  if (!senderSheet) throw new Error('sender_numbers タブが存在しません');
+  normalizedNumbers.forEach(function(num) {
+    appendRowByHeaderNames_(senderSheet, {
+      tenant_id: tenantId, '電話番号': forceTextValue_(num), '名義': numberOwner,
+      status: 'pending', '申請日': now
+    });
+  });
+
+  // 4. メール送信（担当者への受付メール、TF管理者への番号登録依頼メール）
+  sendSignupConfirmationEmail_(contactEmail, companyName, plan, normalizedNumbers);
+  sendSignupAdminNotifyEmail_({
+    tenantId: tenantId, companyName: companyName, numberOwner: numberOwner,
+    numbers: normalizedNumbers, contactName: contactName,
+    contactEmail: contactEmail, contactPhone: contactPhone
+  });
+
+  logAudit_('-', 'signup', contactEmail, 'ok: tenant=' + tenantId);
+
+  return { tenant_id: tenantId, status: 'pending_number' };
+}
+
+// tenant_id発行: 'T'+UUID先頭8桁(大文字)。衝突時は再試行（極めて低確率だが念のため）。
+function generateTenantId_() {
+  for (var i = 0; i < 5; i++) {
+    var candidate = 'T' + Utilities.getUuid().replace(/-/g, '').substring(0, 8).toUpperCase();
+    if (!getTenantById_(candidate)) return candidate;
+  }
+  return 'T' + Utilities.getUuid().replace(/-/g, '').toUpperCase(); // フォールバック（32桁、事実上衝突しない）
+}
+
+// 指定日時が属する月の月末23:59:59（JST）を返す
+function endOfMonthJst_(baseDate) {
+  var d = baseDate || new Date();
+  var ymStr = Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy/MM');
+  var parts = ymStr.split('/');
+  var year  = Number(parts[0]);
+  var month = Number(parts[1]); // 1-12
+  var nextMonth = month === 12 ? 1 : month + 1;
+  var nextYear  = month === 12 ? year + 1 : year;
+  var nextMonthStartStr = nextYear + '/' + ('0' + nextMonth).slice(-2) + '/01 00:00:00';
+  var nextMonthStart = Utilities.parseDate(nextMonthStartStr, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss');
+  return new Date(nextMonthStart.getTime() - 1000); // 翌月1日00:00:00の1秒前 = 当月末23:59:59
+}
+
+function sendSignupConfirmationEmail_(email, companyName, plan, numbers) {
+  var planLabel  = plan === 'standard' ? 'standard（スタンダード）' : 'light（ライト）';
+  var numberList = numbers.map(function(n) { return '　・' + n; }).join('\n');
+  MailApp.sendEmail({
+    to:      email,
+    subject: '【SMS送信侍】お申し込みを受け付けました',
+    body: [
+      (companyName || 'ご担当者') + ' 様',
+      '',
+      'この度はSMS送信侍にお申し込みいただき、誠にありがとうございます。',
+      '以下の内容でお申し込みを受け付けました。',
+      '',
+      'プラン: ' + planLabel,
+      '送信元電話番号:',
+      numberList,
+      '',
+      '【今後の流れ】',
+      '送信元電話番号の登録には約2週間ほどお時間をいただきます。',
+      '登録が完了次第、担当者よりご連絡いたします。',
+      '',
+      'ご不明な点がございましたら本メールにご返信ください。'
+    ].join('\n')
+  });
+}
+
+// TF管理者への通知メール（楽天モバイルへの番号登録申請にそのまま使える形式で整形）
+function sendSignupAdminNotifyEmail_(info) {
+  var adminEmail = getPropOptional_('ADMIN_NOTIFY_EMAIL') || 'tokyoflowerco.ltd@gmail.com';
+  var numberList = info.numbers.map(function(n, i) { return (i + 1) + '. ' + n; }).join('\n');
+  MailApp.sendEmail({
+    to:      adminEmail,
+    subject: '【SMS送信侍】新規申込（楽天モバイル番号登録要）',
+    body: [
+      '新規テナントの申込がありました。楽天モバイルへの番号登録申請をお願いします。',
+      '',
+      '── 楽天モバイル提出用 ──────────────',
+      '名義　　: ' + info.numberOwner,
+      '電話番号:',
+      numberList,
+      '─────────────────────────',
+      '',
+      'tenant_id  : ' + info.tenantId,
+      '会社名　　 : ' + info.companyName,
+      '担当者名　 : ' + info.contactName,
+      '担当者メール: ' + info.contactEmail,
+      '担当者電話 : ' + info.contactPhone
+    ].join('\n')
+  });
 }
 
 
