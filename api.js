@@ -122,7 +122,10 @@ var SCHEMA = [
       'overage_count', 'base_fee', 'overage_fee', 'subtotal', 'tax', 'total',
       'fincode_order_id', 'status', 'charged_at',
       // feat/fincode: 決済失敗時の再試行スケジュール（3日後再試行・2回連続失敗でsuspended）
-      'retry_at', 'retry_count'
+      'retry_at', 'retry_count',
+      // fix/fincode-order-id: fincodeから返却されたaccess_id（決済登録・実行のレスポンスに
+      // 含まれるアクセスID。fincode_order_idと組み合わせて後から状態照会する際に必要）
+      'fincode_access_id'
     ]
   },
   {
@@ -1527,11 +1530,16 @@ function fincodeBaseUrl_() {
 
 // fincode REST APIへの低レベルラッパー。レスポンス本文はJSONとして返すのみで
 // 一切ログに出力しない（カード情報が万一含まれていても記録に残さないため）。
-function fincodeRequest_(method, path, payload) {
+// idempotentKeyを渡すと、fincode公式SDK(fincode-sdk-node)のソースで確認した
+// 実際のHTTPヘッダー名 'idempotent_key' で付与する（POST/PUTの決済登録・実行に
+// 使用。同じキーでの再送は二重処理されず最初のレスポンスが返る）。
+function fincodeRequest_(method, path, payload, idempotentKey) {
   var apiKey = getProp_('FINCODE_API_KEY');
+  var headers = { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' };
+  if (idempotentKey) headers['idempotent_key'] = String(idempotentKey);
   var options = {
     method: method,
-    headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+    headers: headers,
     muteHttpExceptions: true
   };
   if (payload !== undefined && payload !== null) options.payload = JSON.stringify(payload);
@@ -1589,23 +1597,26 @@ function fincodeGetCard_(customerId, cardId) {
   return res.json;
 }
 
-// invoice_idを冪等キーとして決済登録→実行する。同じinvoice_idで複数回呼んでも
-// 二重決済にならない（既存paymentがあればそれを再利用し、CAPTURED済みなら
-// そのまま成功として扱う）。成功時は{id, status:'CAPTURED'}を返し、それ以外は
-// 例外をthrowする。
-function fincodeChargeInvoice_(invoiceId, customerId, cardId, amountYen) {
-  var existing = fincodeRequest_('get', '/v1/payments/' + encodeURIComponent(invoiceId));
+// fix/fincode-order-id: fincodeのorder id（'id'フィールド。invoices.invoice_idとは
+// 別物で、buildFincodeOrderId_で生成した英数字30桁以内のIDを渡すこと）を使って
+// 決済登録→実行する。同じorder idで複数回呼んでも二重決済にならない（既存
+// paymentがあればそれを再利用し、CAPTURED済みならそのまま成功として扱う）。
+// idempotentKeyは決済登録・実行の両方のfincode API呼び出しに付与する
+// （呼び出し元はinvoices.invoice_id＋試行番号を組み合わせて渡すこと）。
+// 成功時は{id, status:'CAPTURED', accessId}を返し、それ以外は例外をthrowする。
+function fincodeChargeInvoice_(orderId, customerId, cardId, amountYen, idempotentKey) {
+  var existing = fincodeRequest_('get', '/v1/payments/' + encodeURIComponent(orderId));
   var payment = (existing.ok && existing.json && existing.json.id) ? existing.json : null;
 
   if (!payment) {
     var create = fincodeRequest_('post', '/v1/payments', {
-      id: invoiceId,
+      id: orderId,
       pay_type: 'Card',
       job_code: 'CAPTURE',
       amount: String(Math.round(amountYen)),
       customer_id: customerId,
       card_id: cardId
-    });
+    }, idempotentKey);
     if (!create.ok || !create.json || !create.json.id) {
       throw new Error(fincodeErrorMessage_(create, '決済の登録に失敗しました'));
     }
@@ -1614,11 +1625,11 @@ function fincodeChargeInvoice_(invoiceId, customerId, cardId, amountYen) {
 
   var status = String(payment.status || '').toUpperCase();
   if (status !== 'CAPTURED') {
-    var exec = fincodeRequest_('put', '/v1/payments/' + encodeURIComponent(invoiceId) + '/execute', {
+    var exec = fincodeRequest_('put', '/v1/payments/' + encodeURIComponent(orderId) + '/execute', {
       pay_type: 'Card',
       method: '1',
       card_id: cardId
-    });
+    }, idempotentKey);
     if (!exec.ok || !exec.json) {
       throw new Error(fincodeErrorMessage_(exec, '決済の実行に失敗しました'));
     }
@@ -1629,7 +1640,73 @@ function fincodeChargeInvoice_(invoiceId, customerId, cardId, amountYen) {
   if (status !== 'CAPTURED') {
     throw new Error('決済が完了しませんでした（status: ' + status + '）');
   }
-  return { id: payment.id, status: status };
+  return { id: payment.id, status: status, accessId: String(payment.access_id || '') };
+}
+
+// fix/fincode-order-id: fincode決済のorder id（'id'フィールド）を生成する。
+//   fincode API制約: 英数字のみ・1〜30桁（診断の結果、標準UUID(36桁・ハイフン
+//   含む)はEC001025008「オーダーIDの書式が正しくありません。」で拒否される
+//   ことを確認済みのため、UUIDではなくこの専用形式を使う）。
+//   形式: 'INV' + 年月(yyyyMM, 6桁) + tenant_id(英数字以外を除去し大文字化) + 試行番号(2桁, 01始まり)
+//     例: tenant_id='T11398058'・年月='202609'・1回目の試行 → 'INV202609T1139805801'
+//   決済失敗時の再試行は、invoices側の行(invoice_id)は同一のまま試行番号だけを
+//   インクリメントし、新しいorder idで登録する（fincode側の「同じorder idは
+//   重複登録エラーになる」動作を回避するための設計）。
+//   生成結果が30桁を超える場合（将来tenant_idの採番方式が変わった場合の安全策）は
+//   決済を実行せず、Logger.log＋管理者通知のうえ例外をthrowする。
+function buildFincodeOrderId_(tenantId, yearMonth, attemptNumber) {
+  var cleanTenantId = String(tenantId || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  var attemptStr = String(Math.max(1, Number(attemptNumber) || 1));
+  if (attemptStr.length < 2) attemptStr = '0' + attemptStr;
+  var orderId = 'INV' + String(yearMonth) + cleanTenantId + attemptStr;
+
+  if (!/^[A-Z0-9]{1,30}$/.test(orderId)) {
+    var msg = 'fincode order idの生成に失敗しました（30桁超過または不正文字。tenant_idの採番方式をご確認ください）: length=' + orderId.length;
+    Logger.log('[buildFincodeOrderId_] ' + msg + ' tenant_id=' + tenantId + ' yearMonth=' + yearMonth);
+    notifyOrderIdFormatError_(tenantId, yearMonth, orderId.length);
+    throw new Error(msg);
+  }
+  return orderId;
+}
+
+// fix/fincode-order-id: buildFincodeOrderId_が30桁超過等でorder id生成に失敗した際の
+// 管理者通知（通常運用では発生しない想定の安全策のため、テナント宛メールは送らない）。
+function notifyOrderIdFormatError_(tenantId, yearMonth, orderIdLength) {
+  var adminEmail = getPropOptional_('ADMIN_NOTIFY_EMAIL') || 'tokyoflowerco.ltd@gmail.com';
+  var subject = '【SMS送信侍】fincode order id生成エラー（書式異常）';
+  var body = [
+    'fincode決済用のorder id生成で桁数上限(30桁)を超えたため、決済処理を停止しました。',
+    '',
+    'tenant_id: ' + tenantId,
+    '年月: ' + yearMonth,
+    '生成されたorder idの長さ: ' + orderIdLength + '桁',
+    '',
+    'tenant_idの採番方式が変更された可能性があります。buildFincodeOrderId_の生成ロジックをご確認ください。'
+  ].join('\n');
+  sendMailWithQuotaGuard_(adminEmail, subject, body, 'notifyOrderIdFormatError_admin');
+}
+
+// fix/fincode-order-id: fincodeのidempotent_keyヘッダー用の値を、invoice_id（内部UUID）
+// ＋試行番号から決定的に導出する。
+//   検証の結果、fincodeのidempotent_keyは厳密なUUID形式でないと
+//   「冪等キーの書式が正しくありません。」で拒否されることを確認したため、
+//   単純な文字列結合（invoice_id + '-' + 試行番号）は使えない。そのため
+//   MD5ハッシュをUUID v4の見た目（8-4-4-4-12・version=4・variant=8〜b）に
+//   整形して使う。同じinvoice_id・試行番号からは常に同じ値になるため、
+//   同じ試行のリクエストが万一複数回送信されても同じキーとなり、
+//   fincode側の重複防止が正しく機能する。
+function buildIdempotentKey_(invoiceId, attemptNumber) {
+  var raw = String(invoiceId) + ':' + String(attemptNumber);
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, raw, Utilities.Charset.UTF_8);
+  var hex = digest.map(function(b) {
+    return ('0' + ((b + 256) % 256).toString(16)).slice(-2);
+  }).join('');
+  var versionNibble = '4';
+  var variantNibble = ((parseInt(hex.charAt(16), 16) & 0x3) | 0x8).toString(16);
+  return hex.substring(0, 8) + '-' + hex.substring(8, 12) + '-' +
+         versionNibble + hex.substring(13, 16) + '-' +
+         variantNibble + hex.substring(17, 20) + '-' +
+         hex.substring(20, 32);
 }
 
 // カード番号のような12〜19桁の連続数字を万一含んでいた場合にマスクする多層防御
@@ -2143,7 +2220,11 @@ function appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, status) {
     if (h === 'subtotal')         return calc.subtotal;
     if (h === 'tax')              return calc.tax;
     if (h === 'total')            return calc.total;
-    if (h === 'fincode_order_id') return invoiceId;
+    // fix/fincode-order-id: fincode_order_idはinvoice_idの複製ではなく、実際に
+    // fincodeへ送った試行ごとのorder id（buildFincodeOrderId_の結果）を格納する
+    // 列に変更した。決済を実際に試みるまでは空欄のままにし、
+    // attemptInvoicePayment_が試行時に都度上書きする（未決済(skipped/unpaid)の
+    // 行にfincode未送信のIDが入っているように見えるのを防ぐため）。
     if (h === 'status')           return status;
     if (h === 'retry_count')      return 0;
     return '';
@@ -2162,11 +2243,46 @@ function appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, status) {
 //     以後の自動再試行は行わない（suspended通知メール）。2未満ならretry_atを
 //     3日後に設定し、担当者・管理者へ失敗通知メールを送る。
 function attemptInvoicePayment_(sheet, col, sheetRow, invoiceId, calcLike, tenant, currentRetryCount) {
+  // fix/fincode-order-id: 試行ごとに新しいfincode order idを生成する（同じ行の
+  // まま試行番号だけをインクリメント）。attemptNumber=1が初回、失敗して
+  // retry_countが1になった状態からの再試行がattemptNumber=2、という対応。
+  var attemptNumber = currentRetryCount + 1;
+  var attemptStr = String(attemptNumber);
+  if (attemptStr.length < 2) attemptStr = '0' + attemptStr;
+
+  var orderId;
   try {
-    fincodeChargeInvoice_(invoiceId, tenant.fincode_customer_id, tenant.fincode_card_id, calcLike.total);
+    orderId = buildFincodeOrderId_(tenant.tenant_id, calcLike.yearMonth, attemptNumber);
+  } catch (e) {
+    // order id自体が生成できない（30桁超過等）場合は決済を実行せず失敗として
+    // 扱う。通知はbuildFincodeOrderId_内で既に送信済みのため、ここでは
+    // それ以上のメール送信・retry_countの加算は行わない（テナント側の問題では
+    // なく設定不備のため、人手での調査が必要）。
+    sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
+    return { status: 'failed', suspended: false, error: maskCardLike_(e.message) };
+  }
+
+  if (col['fincode_order_id'] !== undefined) {
+    sheet.getRange(sheetRow, col['fincode_order_id'] + 1).setValue(orderId);
+  }
+
+  // idempotent_keyヘッダーの値: invoice_id(行を識別する内部UUID)＋試行番号を
+  // 元にした値。同じ試行を誤って複数回送信しても二重処理されないようにするため。
+  //   検証の結果、fincodeのidempotent_keyは厳密なUUID(v4)形式でないと
+  //   「冪等キーの書式が正しくありません。」で拒否されることが判明したため、
+  //   単純な文字列結合ではなく buildIdempotentKey_ でinvoice_id＋試行番号から
+  //   決定的にUUID形式のキーを導出する（同じinvoice_id＋試行番号なら常に同じ
+  //   キーになる＝再送時も同じキーを再現できる）。
+  var idempotentKey = buildIdempotentKey_(invoiceId, attemptNumber);
+
+  try {
+    var payment = fincodeChargeInvoice_(orderId, tenant.fincode_customer_id, tenant.fincode_card_id, calcLike.total, idempotentKey);
     sheet.getRange(sheetRow, col['status'] + 1).setValue('paid');
     sheet.getRange(sheetRow, col['charged_at'] + 1).setValue(new Date());
     sheet.getRange(sheetRow, col['retry_at'] + 1).setValue('');
+    if (col['fincode_access_id'] !== undefined) {
+      sheet.getRange(sheetRow, col['fincode_access_id'] + 1).setValue(payment.accessId || '');
+    }
     sendInvoicePaidEmail_(tenant, calcLike);
     return { status: 'paid' };
   } catch (e) {
