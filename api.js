@@ -108,6 +108,11 @@ var SCHEMA = [
   {
     sheetProp: 'SMS_SHEET_ID', tab: 'usage_system',
     headers: ['日付', 'api_calls', 'mail_quota_remaining', 'notes']
+  },
+  {
+    // 積み残し3件目: addendum F メール翌日再送用キュー
+    sheetProp: 'SMS_SHEET_ID', tab: 'mail_queue',
+    headers: ['to', 'subject', 'body', 'created_at', 'status', 'attempts']
   }
 ];
 
@@ -1417,6 +1422,15 @@ function ensureTriggers_() {
     created.push('archiveLog_ (毎月1日 02:00 JST)');
   }
 
+  // 積み残し3件目: addendum Fのメール翌日再送（毎日00:10 JST）
+  if (existingFns['flushMailQueue_']) {
+    skipped.push('flushMailQueue_');
+  } else {
+    ScriptApp.newTrigger('flushMailQueue_').timeBased()
+      .everyDays(1).atHour(0).nearMinute(10).inTimezone('Asia/Tokyo').create();
+    created.push('flushMailQueue_ (毎日 00:10 JST)');
+  }
+
   return { created: created, skipped: skipped };
 }
 
@@ -1653,6 +1667,87 @@ function archiveLog_() {
   return { action: 'warn_threshold_exceeded', rowCount: rowCount, threshold: ARCHIVE_THRESHOLD_ROWS };
 }
 
+// ────────────────────────────────────────────────────────────────────
+// flushMailQueue_: 積み残し3件目(addendum Fのメール翌日再送)。
+//   mail_queueのstatus='pending'行を古い順に処理し、MailApp.sendEmailで
+//   再送を試みる（毎日00:10 JSTのトリガーから呼ばれる想定）。
+//   成功→status='sent'。失敗→attempts+1し、3回未満はpendingのまま
+//   次回に持ち越し、3回以上でstatus='failed'を確定し管理者へ通知する。
+// ────────────────────────────────────────────────────────────────────
+function flushMailQueue_() {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('mail_queue');
+  if (!sheet) {
+    Logger.log('[flushMailQueue_] mail_queueタブが見つかりません。no-op。');
+    return { action: 'noop', reason: 'sheet_missing' };
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { action: 'noop', reason: 'no_data_rows' };
+
+  var lastCol = sheet.getLastColumn();
+  var hdr = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).trim(); });
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+
+  var data  = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  var stats = { processed: 0, sent: 0, failed: 0, retried: 0 };
+
+  for (var r = 0; r < data.length; r++) {
+    var status = String(data[r][col['status']] || '').trim();
+    if (status !== 'pending') continue;
+
+    var sheetRow = r + 2;
+    var to       = String(data[r][col['to']] || '');
+    var subject  = String(data[r][col['subject']] || '');
+    var body     = String(data[r][col['body']] || '');
+    var attempts = Number(data[r][col['attempts']]) || 0;
+
+    stats.processed++;
+    try {
+      MailApp.sendEmail({ to: to, subject: subject, body: body });
+      sheet.getRange(sheetRow, col['status'] + 1).setValue('sent');
+      stats.sent++;
+    } catch (e) {
+      attempts++;
+      sheet.getRange(sheetRow, col['attempts'] + 1).setValue(attempts);
+      if (attempts >= 3) {
+        sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
+        stats.failed++;
+        notifyMailRetryFailed_(to, subject, attempts, e.message);
+      } else {
+        stats.retried++; // statusは'pending'のまま据え置き（次回のflushMailQueue_実行で再試行）
+      }
+    }
+  }
+
+  Logger.log('[flushMailQueue_] ' + JSON.stringify(stats));
+  return stats;
+}
+
+// 管理者への「メール再送に失敗しました」通知。checkMailQuota_のガード対象外＝最優先で送る。
+//   通知自体が失敗しても例外を外に漏らさない（flushMailQueue_を止めないため）。
+function notifyMailRetryFailed_(to, subject, attempts, lastError) {
+  var adminEmail = getPropOptional_('ADMIN_NOTIFY_EMAIL') || 'tokyoflowerco.ltd@gmail.com';
+  try {
+    MailApp.sendEmail({
+      to:      adminEmail,
+      subject: '【SMS送信侍】メール再送に失敗しました',
+      body: [
+        '以下のメールの再送に' + attempts + '回失敗したため、送信を断念しました（キューからはfailed扱いで確定）。',
+        '',
+        '宛先: ' + to,
+        '件名: ' + subject,
+        '最後のエラー: ' + (lastError || '(不明)'),
+        '',
+        '手動での対応をご検討ください。'
+      ].join('\n')
+    });
+  } catch (e) {
+    Logger.log('[notifyMailRetryFailed_] 通知メール送信にも失敗しました: ' + e.message);
+  }
+}
+
 // listTenants: tenants タブの全行をオブジェクト配列で返す
 function handleListTenants_(body) {
   requireAdmin_(body);
@@ -1828,26 +1923,41 @@ function checkMailQuota_() {
   return MailApp.getRemainingDailyQuota() < 10;
 }
 
+// addendum F(積み残し3件目): checkMailQuota_でスキップされたメールをmail_queueに積む。
+//   flushMailQueue_（毎日00:10 JSTトリガー）が翌日以降に再送を試みる。
+function enqueueMailForRetry_(to, subject, body) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('mail_queue');
+  if (!sheet) {
+    Logger.log('[enqueueMailForRetry_] mail_queueタブが見つからないためキューイングできません。 to=' + to);
+    return;
+  }
+  appendRowByHeaderNames_(sheet, {
+    to: to, subject: subject, body: body,
+    created_at: new Date(), status: 'pending', attempts: 0
+  });
+}
+
 function sendInitialPasswordEmail_(email, id, plainPw) {
+  var subject = '【SMS送信侍】アカウント発行のお知らせ';
+  var body    = [
+    'アカウントを発行しました。',
+    '',
+    'ログインID: ' + id,
+    '初期パスワード: ' + plainPw,
+    '',
+    '初回ログイン後、お早めにパスワードの変更をご検討ください。',
+    '心当たりのない場合はこのメールを無視してください。'
+  ].join('\n');
+
   if (checkMailQuota_()) {
-    Logger.log('[sendInitialPasswordEmail_] メール送信不可(クォータ残少)のため送信をスキップしました。'
-      + '翌日以降に管理者が確認・対応してください。 email=' + email + ' id=' + id);
+    Logger.log('[sendInitialPasswordEmail_] メール送信不可(クォータ残少)のためmail_queueに積みました。'
+      + '翌日以降に自動再送されます。 email=' + email + ' id=' + id);
+    enqueueMailForRetry_(email, subject, body);
     return;
   }
   // 平文パスワードはメール本文のみ。ログ・レスポンスには一切出さない。
-  MailApp.sendEmail({
-    to:      email,
-    subject: '【SMS送信侍】アカウント発行のお知らせ',
-    body:    [
-      'アカウントを発行しました。',
-      '',
-      'ログインID: ' + id,
-      '初期パスワード: ' + plainPw,
-      '',
-      '初回ログイン後、お早めにパスワードの変更をご検討ください。',
-      '心当たりのない場合はこのメールを無視してください。'
-    ].join('\n')
-  });
+  MailApp.sendEmail({ to: email, subject: subject, body: body });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2766,63 +2876,63 @@ function endOfMonthJst_(baseDate) {
 }
 
 function sendSignupConfirmationEmail_(email, companyName, plan, numbers) {
-  if (checkMailQuota_()) {
-    Logger.log('[sendSignupConfirmationEmail_] メール送信不可(クォータ残少)のため送信をスキップしました。'
-      + '翌日以降に管理者が確認・対応してください。 email=' + email + ' companyName=' + companyName);
-    return;
-  }
   var planLabel  = plan === 'standard' ? 'standard（スタンダード）' : 'light（ライト）';
   var numberList = numbers.map(function(n) { return '　・' + n; }).join('\n');
-  MailApp.sendEmail({
-    to:      email,
-    subject: '【SMS送信侍】お申し込みを受け付けました',
-    body: [
-      (companyName || 'ご担当者') + ' 様',
-      '',
-      'この度はSMS送信侍にお申し込みいただき、誠にありがとうございます。',
-      '以下の内容でお申し込みを受け付けました。',
-      '',
-      'プラン: ' + planLabel,
-      '送信元電話番号:',
-      numberList,
-      '',
-      '【今後の流れ】',
-      '送信元電話番号の登録には約2週間ほどお時間をいただきます。',
-      '登録が完了次第、担当者よりご連絡いたします。',
-      '',
-      'ご不明な点がございましたら本メールにご返信ください。'
-    ].join('\n')
-  });
+  var subject = '【SMS送信侍】お申し込みを受け付けました';
+  var body = [
+    (companyName || 'ご担当者') + ' 様',
+    '',
+    'この度はSMS送信侍にお申し込みいただき、誠にありがとうございます。',
+    '以下の内容でお申し込みを受け付けました。',
+    '',
+    'プラン: ' + planLabel,
+    '送信元電話番号:',
+    numberList,
+    '',
+    '【今後の流れ】',
+    '送信元電話番号の登録には約2週間ほどお時間をいただきます。',
+    '登録が完了次第、担当者よりご連絡いたします。',
+    '',
+    'ご不明な点がございましたら本メールにご返信ください。'
+  ].join('\n');
+
+  if (checkMailQuota_()) {
+    Logger.log('[sendSignupConfirmationEmail_] メール送信不可(クォータ残少)のためmail_queueに積みました。'
+      + '翌日以降に自動再送されます。 email=' + email + ' companyName=' + companyName);
+    enqueueMailForRetry_(email, subject, body);
+    return;
+  }
+  MailApp.sendEmail({ to: email, subject: subject, body: body });
 }
 
 // TF管理者への通知メール（楽天モバイルへの番号登録申請にそのまま使える形式で整形）
 function sendSignupAdminNotifyEmail_(info) {
-  if (checkMailQuota_()) {
-    Logger.log('[sendSignupAdminNotifyEmail_] メール送信不可(クォータ残少)のため送信をスキップしました。'
-      + '翌日以降に管理者が確認・対応してください。 tenant_id=' + info.tenantId + ' companyName=' + info.companyName);
-    return;
-  }
   var adminEmail = getPropOptional_('ADMIN_NOTIFY_EMAIL') || 'tokyoflowerco.ltd@gmail.com';
   var numberList = info.numbers.map(function(n, i) { return (i + 1) + '. ' + n; }).join('\n');
-  MailApp.sendEmail({
-    to:      adminEmail,
-    subject: '【SMS送信侍】新規申込（楽天モバイル番号登録要）',
-    body: [
-      '新規テナントの申込がありました。楽天モバイルへの番号登録申請をお願いします。',
-      '',
-      '── 楽天モバイル提出用 ──────────────',
-      '名義　　: ' + info.numberOwner,
-      '電話番号:',
-      numberList,
-      '─────────────────────────',
-      '',
-      'tenant_id  : ' + info.tenantId,
-      '会社名　　 : ' + info.companyName,
-      '担当者名　 : ' + info.contactName,
-      '担当者メール: ' + info.contactEmail,
-      '担当者電話 : ' + info.contactPhone
-    ].join('\n')
-  });
+  var subject = '【SMS送信侍】新規申込（楽天モバイル番号登録要）';
+  var body = [
+    '新規テナントの申込がありました。楽天モバイルへの番号登録申請をお願いします。',
+    '',
+    '── 楽天モバイル提出用 ──────────────',
+    '名義　　: ' + info.numberOwner,
+    '電話番号:',
+    numberList,
+    '─────────────────────────',
+    '',
+    'tenant_id  : ' + info.tenantId,
+    '会社名　　 : ' + info.companyName,
+    '担当者名　 : ' + info.contactName,
+    '担当者メール: ' + info.contactEmail,
+    '担当者電話 : ' + info.contactPhone
+  ].join('\n');
+
+  if (checkMailQuota_()) {
+    Logger.log('[sendSignupAdminNotifyEmail_] メール送信不可(クォータ残少)のためmail_queueに積みました。'
+      + '翌日以降に自動再送されます。 tenant_id=' + info.tenantId + ' companyName=' + info.companyName);
+    enqueueMailForRetry_(adminEmail, subject, body);
+    return;
+  }
+  MailApp.sendEmail({ to: adminEmail, subject: subject, body: body });
 }
 
 // ────────────────────────────────────────────────────────────────────
