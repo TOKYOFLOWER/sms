@@ -87,7 +87,12 @@ var SCHEMA = [
   },
   {
     sheetProp: 'SMS_SHEET_ID', tab: 'sender_numbers',
-    headers: ['tenant_id', '電話番号', '名義', 'status', '申請日', '登録日', 'sms_account_key'],
+    headers: [
+      'tenant_id', '電話番号', '名義', 'status', '申請日', '登録日', 'sms_account_key',
+      // fix/tenant-send: registered行が複数ある場合に優先する行を示すフラグ('1'で優先)。
+      // 既存行には影響しない末尾追加列（resolveSender_が参照）。
+      'is_default'
+    ],
     phoneColumns: ['電話番号']
   },
   {
@@ -253,11 +258,12 @@ function handleSendSms_(body) {
   rateLimitCheck_(id);
 
   var tenant = resolveTenantForMember_(member);
-  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member, tenant);
-  if (!effectiveAccountId) {
+  var resolved = resolveEffectiveSmsAccountIdSafe_(member, tenant);
+  if (!resolved || !resolved.smsAccountId) {
     throw new Error('送信元番号の準備中です。しばらくお待ちください');
   }
-  var isFallback = effectiveAccountId !== id;
+  var effectiveAccountId = resolved.smsAccountId;
+  var isFallback = resolved.isFallback;
 
   var result = sendSingleSMSFromForm({
     accountId:      id,
@@ -282,11 +288,12 @@ function handleSendSmsForm_(body) {
   rateLimitCheck_(id);
 
   var tenant = resolveTenantForMember_(member);
-  var effectiveAccountId = resolveEffectiveSmsAccountIdSafe_(member, tenant);
-  if (!effectiveAccountId) {
+  var resolved = resolveEffectiveSmsAccountIdSafe_(member, tenant);
+  if (!resolved || !resolved.smsAccountId) {
     throw new Error('送信元番号の準備中です。しばらくお待ちください');
   }
-  var isFallback = effectiveAccountId !== id;
+  var effectiveAccountId = resolved.smsAccountId;
+  var isFallback = resolved.isFallback;
 
   var result = sendSingleSMSFromForm({
     accountId:      id,
@@ -301,14 +308,14 @@ function handleSendSmsForm_(body) {
   return result;
 }
 
-// resolveEffectiveAccountId_ を呼び出すラッパー（handleSendSms_/handleSendSmsForm_用）。
+// resolveSender_ を呼び出すラッパー（handleSendSms_/handleSendSmsForm_用）。
 //   フォールバック上限到達の専用エラー(fallbackSendLimitError_)はそのまま呼び出し元へ
 //   伝える（意図的な業務エラーのため。doPostの既存エラーハンドリング方針に沿ってクリーンに
 //   ok:falseへ変換される）。それ以外の想定外エラーは安全側に倒してnull（「準備中」扱い）にし、
 //   絶対に例外で落ちないようにする。
 function resolveEffectiveSmsAccountIdSafe_(member, tenant) {
   try {
-    return resolveEffectiveAccountId_(member, tenant);
+    return resolveSender_(member, tenant);
   } catch (e) {
     if (String(e.message || '').indexOf('番号登録完了までお待ちください') === 0) {
       throw e;
@@ -361,7 +368,20 @@ function handleBulkSend_(body) {
     scheduledAt = parsed;
   }
 
-  var smsAcc     = getSmsAccount_(id);
+  // fix/tenant-send: 以前はgetSmsAccount_(id)（会員自身のID）で直接引いており、
+  // テナント会員（sms_accountsはtenant_idではなくsms_account_key、例:'tokyoflower'、
+  // で管理されている）の場合は解決できずfromが空欄になっていた。resolveSender_に
+  // 統一し、他経路(handleSendSms_/handleSendSmsForm_/processQueue_)と同じロジックで
+  // 解決する。ここでの失敗（フォールバック上限到達等）はqueue投入時点でエラーに
+  // せず、実際の送信可否はprocessQueue_側で都度再判定させる（既存の寛容な挙動を維持）。
+  var resolvedSmsAccountId = null;
+  try {
+    var resolvedForBulk = resolveSender_(member, tenant);
+    resolvedSmsAccountId = resolvedForBulk.smsAccountId;
+  } catch (e) {
+    resolvedSmsAccountId = null;
+  }
+  var smsAcc     = resolvedSmsAccountId ? getSmsAccount_(resolvedSmsAccountId) : null;
   var senderFrom = smsAcc ? normalizePhoneFrom_(smsAcc.cpaas_sender) : '';
 
   var batchId = Utilities.getUuid();
@@ -1653,21 +1673,22 @@ function processQueue_() {
       // 積み残し2件目: 送信元番号pending中は共通テスト番号へフォールバック。
       // 未設定でnullが返る場合、またはフォールバック送信の上限到達の場合は
       // failed確定（いずれもリトライしても解決しないため）。
-      var effectiveAccountId;
+      var resolved;
       var effectiveAccountError = null;
       try {
-        effectiveAccountId = resolveEffectiveAccountId_({ id: memberId }, tenant);
+        resolved = resolveSender_({ id: memberId }, tenant);
       } catch (e) {
-        effectiveAccountId = null;
+        resolved = null;
         effectiveAccountError = e.message;
       }
-      if (!effectiveAccountId) {
+      if (!resolved || !resolved.smsAccountId) {
         sheet.getRange(sheetRow, col['status'] + 1).setValue('failed');
         sheet.getRange(sheetRow, col['result'] + 1).setValue(effectiveAccountError || '送信元番号の準備中です。しばらくお待ちください');
         stats.failed++;
         continue;
       }
-      var isFallback = effectiveAccountId !== memberId;
+      var effectiveAccountId = resolved.smsAccountId;
+      var isFallback = resolved.isFallback;
 
       var sendResult = sendSingleSMSFromForm({
         accountId:      memberId,
@@ -1974,6 +1995,10 @@ function handleUpdateSenderNumber_(body) {
 
     if (body.status !== undefined && col['status'] !== undefined) {
       sheet.getRange(r + 1, col['status'] + 1).setValue(body.status);
+      // fix/tenant-send: statusをregisteredにした時点で登録日を自動セットする
+      if (String(body.status).trim().toLowerCase() === 'registered' && col['登録日'] !== undefined) {
+        sheet.getRange(r + 1, col['登録日'] + 1).setValue(new Date());
+      }
     }
     if (body.sms_account_key !== undefined && col['sms_account_key'] !== undefined) {
       sheet.getRange(r + 1, col['sms_account_key'] + 1).setValue(body.sms_account_key);
@@ -2050,10 +2075,41 @@ function handleIssueAccount_(body) {
   });
   sheet.appendRow(row);
 
+  // fix/tenant-send: アカウント発行時点でtenants.statusが'pending_number'なら
+  // 'trial'へ自動遷移させる（trial_endは申込月末のまま変更しない）。
+  transitionTenantStatusOnIssueAccount_(tenantId);
+
   sendInitialPasswordEmail_(email, id, plainPw);
   logAudit_('admin', 'issueAccount', id, 'ok: tenant=' + tenantId);
 
   return { id: id, tenant_id: tenantId, email: email };
+}
+
+// handleIssueAccount_専用: tenants.statusが'pending_number'の場合のみ'trial'へ
+// 自動遷移させる（trial_endは申込月末のまま変更しない）。それ以外のstatus
+// （trial/active/suspended等）は変更しない。
+function transitionTenantStatusOnIssueAccount_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('tenants');
+  if (!sheet) return;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['status'] === undefined) return;
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    var currentStatus = String(data[r][col['status']]).trim();
+    if (currentStatus === 'pending_number') {
+      sheet.getRange(r + 1, col['status'] + 1).setValue('trial');
+      if (col['updated_at'] !== undefined) {
+        sheet.getRange(r + 1, col['updated_at'] + 1).setValue(new Date());
+      }
+    }
+    return;
+  }
 }
 
 // 初期パスワード生成（UUIDから記号を除いた英数字12文字）
@@ -2524,24 +2580,82 @@ function fallbackSendLimitError_() {
   return new Error('番号登録完了までお待ちください（テスト送信の上限に達しました）');
 }
 
-// resolveEffectiveAccountId_: sendSingleSMSFromFormのsmsAccountId解決に使う実効アカウントIDを返す。
-//   ・tenant管理外（GSD含む、tenants未登録）は従来通りmember.idをそのまま返す
-//     （既存動作を一切変えない）。
-//   ・tenant管理下でhasRegisteredSenderNumber_がtrueならmember.idを返す
-//     （自番号。既存の「1会員1送信元(sms_accounts)」の仕組みのまま）。
-//   ・registeredが1件も無い場合、フォールバック送信回数(tenants.fallback_send_count)
-//     がFALLBACK_SEND_LIMIT(30)に達していれば専用エラーをthrowする（上限到達）。
-//     達していなければ Script Property COMMON_TEST_SENDER_KEY
-//     （getPropOptional_で取得。無ければtenant.fallback_sms_account_keyを見る）
-//     を返す。取得できた場合はtenants.fallback_sms_account_key列にキャッシュする。
-//   ・最終的にnullなら「送信元番号の準備中」を意味し、呼び出し元でエラー処理すること。
-function resolveEffectiveAccountId_(member, tenant) {
-  if (!tenant || String(tenant.tenant_id).trim() === 'GSD') {
-    return member.id; // tenant管理外(GSD含む)は従来通り自番号
+// sender_numbersタブから該当tenant_idの status='registered' 行を1件解決する。
+//   複数件ある場合はis_default='1'の行を優先し、無ければ最初に見つかった行を返す。
+//   該当行が無ければnull。戻り値は {電話番号, sms_account_key, is_default, row} 形式。
+function findRegisteredSenderNumber_(tenantId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('sender_numbers');
+  if (!sheet || sheet.getLastRow() < 2) return null;
+
+  var data = sheet.getDataRange().getValues();
+  var hdr  = data[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col  = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['status'] === undefined || col['sms_account_key'] === undefined) {
+    return null;
   }
 
-  if (hasRegisteredSenderNumber_(tenant.tenant_id)) {
-    return member.id; // 自番号（registered済みなのでこの会員のsms_accounts行が用意されている前提）
+  var candidates = [];
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (String(data[r][col['status']]).trim().toLowerCase() !== 'registered') continue;
+    var key = col['sms_account_key'] !== undefined ? String(data[r][col['sms_account_key']] || '').trim() : '';
+    if (!key) continue; // sms_account_key未設定のregistered行は解決不能なため候補から除外
+    candidates.push({
+      row: r + 1,
+      電話番号: col['電話番号'] !== undefined ? data[r][col['電話番号']] : '',
+      sms_account_key: key,
+      is_default: col['is_default'] !== undefined ? String(data[r][col['is_default']]).trim() : ''
+    });
+  }
+  if (!candidates.length) return null;
+
+  var preferred = candidates.filter(function(c) { return c.is_default === '1'; })[0];
+  return preferred || candidates[0];
+}
+
+// resolveSender_: 実際の送信に使う sms_accounts のキー（＝smsAccountId）と、
+//   それが「フォールバック送信（共通テスト番号）」かどうかを解決する単一の窓口関数。
+//   handleSendSms_/handleSendSmsForm_/processQueue_/handleBulkSend_の全経路が
+//   この関数を経由する（以前は経路ごとに解決方法がばらばらだった）。
+//
+//   戻り値: { smsAccountId: string|null, isFallback: boolean }
+//   ※ 以前は smsAccountId の文字列のみを返し、呼び出し元が
+//     「effectiveAccountId !== member.id なら fallback」という比較で
+//     isFallback を判定していた。しかし本修正でregistered済みの場合に
+//     sms_account_key（例:'tokyoflower'。member.idとは別物）を返すようにした
+//     ため、その比較方式では正規のregistered送信まで誤ってfallback扱いに
+//     なってしまう（【テスト送信】接頭辞の誤付与・fallback_send_countの誤加算という
+//     実害を検証で確認した）。そのため isFallback を本関数が明示的に返す方式に変更した。
+//
+//   優先順位:
+//   a. tenant管理外（GSD含む、tenants未登録）は従来通りmember.idをそのまま返す
+//      （既存動作を一切変えない。isFallback:false）。
+//   b. sender_numbersタブのstatus='registered'行（is_default='1'優先）が見つかれば、
+//      その行のsms_account_key列の値を返す（isFallback:false）。
+//      ※ 以前はここで誤って member.id をそのまま返していたのが本バグの直接原因
+//        だった（「registered済みなら自会員IDでsms_accountsが引ける」という誤った
+//        前提。実際にはsms_account_key（例: 'tokyoflower'）とmember.id（例:
+//        'testkk-owner'）は別物）。
+//   c. registeredが1件も無い場合、フォールバック送信回数(tenants.fallback_send_count)
+//      がFALLBACK_SEND_LIMIT(30)に達していれば専用エラーをthrowする（上限到達）。
+//      達していなければ Script Property COMMON_TEST_SENDER_KEY
+//      （getPropOptional_で取得。無ければtenant.fallback_sms_account_keyを見る）
+//      を返す（isFallback:true）。取得できた場合はtenants.fallback_sms_account_key列にキャッシュする。
+//   d. どちらも解決できない場合は smsAccountId:null を返す。GSD経路(a)は必ず
+//      member.idを返すため、GSD会員の実際の設定不備は後段のsendSingleSMSFromForm
+//      が「送信元設定がありません。管理者に連絡してください」で検出する。
+//      テナント会員がnullを受け取った場合、呼び出し元は「送信元番号の準備中です」
+//      という趣旨のエラーに変換すること（「管理者に連絡してください」は出さない）。
+function resolveSender_(member, tenant) {
+  if (!tenant || String(tenant.tenant_id).trim() === 'GSD') {
+    return { smsAccountId: member.id, isFallback: false }; // tenant管理外(GSD含む)は従来通り自番号
+  }
+
+  var registered = findRegisteredSenderNumber_(tenant.tenant_id);
+  if (registered) {
+    return { smsAccountId: registered.sms_account_key, isFallback: false }; // sender_numbers行のsms_account_key（例: 'tokyoflower'）
   }
 
   var fallbackCount = Number(tenant.fallback_send_count) || 0;
@@ -2554,7 +2668,7 @@ function resolveEffectiveAccountId_(member, tenant) {
     setTenantFallbackSmsAccountKey_(tenant.tenant_id, commonKey); // キャッシュ（無くても機能に影響しない）
     tenant.fallback_sms_account_key = commonKey;
   }
-  return commonKey || null;
+  return { smsAccountId: commonKey || null, isFallback: !!commonKey };
 }
 
 // token検証 + 会員の有効性確認をまとめたヘルパー（STEP5a各actionで共通）
@@ -2620,20 +2734,29 @@ function handleMyTenantStatus_(body) {
   }
 
   // 積み残し2件目: 送信元番号がregistered済みでないテナントには案内文言を返す
+  // fix/tenant-send: docs/index.html のコンソール表示（会社名＋登録済み送信元番号の
+  // 表示）用に、registered行（is_default優先）の電話番号も併せて解決する。
+  var registeredSender = isGsd ? null : findRegisteredSenderNumber_(tenant.tenant_id);
   var senderNumberNotice = null;
-  if (!isGsd && !hasRegisteredSenderNumber_(tenant.tenant_id)) {
+  if (!isGsd && !registeredSender) {
     senderNumberNotice = '番号登録申請中（約2週間）：テスト用共通番号で送信されます';
   }
 
   return {
     tenant_id:   tenant.tenant_id,
+    // GSD会員は会社名の概念が無いため空文字（フロント側はGSD表示を一切変更しないため未使用）
+    '会社名':    isGsd ? '' : String(tenant['会社名'] || ''),
     plan:        tenant.plan || 'standard',
     status:      tenant.status || 'active',
     free_used:   usage.free_used,
     sent_count:  usage.sent_count,
     daily_limit: dailyLimit,
+    // trial中の無料枠残数計算用（GSDはnull=無制限扱いのため対象外）
+    trial_free_limit: isGsd ? null : (Number(tenant.trial_free_limit) || null),
     todaySent:   countTodaySent_(tenant.tenant_id),
-    senderNumberNotice: senderNumberNotice
+    senderNumberNotice: senderNumberNotice,
+    // 登録済み送信元番号（無ければnull＝フォールバック中）。ハイフン等の整形はフロント側で行う。
+    registeredSenderNumber: registeredSender ? String(registeredSender['電話番号'] || '') : null
   };
 }
 

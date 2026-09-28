@@ -334,6 +334,15 @@ function selectTenant(tenantId) {
   });
   document.getElementById('pc-tenant-id').value = tenantId;
   document.getElementById('ia-tenant-id').value = tenantId;
+
+  // fix/tenant-send: アカウント発行フォームの3項目を自動入力する（手動で編集可能なまま）。
+  const tenant = tenantsCache.find(t => String(t['tenant_id'] || '') === tenantId);
+  if (tenant) {
+    document.getElementById('ia-id').value = 't' + String(tenantId).toLowerCase() + '-owner';
+    document.getElementById('ia-email').value = tenant['担当者メール'] || '';
+    document.getElementById('ia-contact-name').value = tenant['担当者名'] || '';
+  }
+
   loadSenderNumbers(tenantId);
 }
 
