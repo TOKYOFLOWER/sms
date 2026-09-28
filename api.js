@@ -14,6 +14,73 @@ var LOG_HEADERS = [
   'result_code', 'result_message', 'message_id', 'how_many_messages', '文字数情報'
 ];
 
+// ────────────────────────────────────────────────────────────────────
+// SCHEMA: 商用化データモデル（タブ→ヘッダーの単一情報源）
+//   ensureSchema_() がこれを走査してシート作成・列追加を行う。
+//   ・sheetProp:      'MASTER_SHEET_ID' | 'SMS_SHEET_ID'（getProp_() で解決）
+//   ・headers:        新規作成時に書き込むヘッダー全体。既存必須タブ（headers未定義な
+//                      らタブが無くても作成しない＝存在前提のタブ）は null。
+//   ・appendHeaders:  既存タブの末尾に追記する列（無ければ headers 全体を追記候補にする）。
+//   ・phoneColumns:   電話番号を格納する列名。setNumberFormat('@') を適用する対象。
+//   既存列の削除・並び替えは絶対に行わない（末尾追加のみ）。
+// ────────────────────────────────────────────────────────────────────
+var SCHEMA = [
+  // ---- 既存タブ: 末尾に列追加のみ（タブが無い場合は作成しない） ----
+  {
+    sheetProp: 'MASTER_SHEET_ID', tab: 'api_key',
+    headers: null,
+    appendHeaders: ['tenant_id', 'role']
+  },
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'log',
+    headers: LOG_HEADERS,
+    appendHeaders: ['tenant_id', 'batch_id']
+  },
+
+  // ---- 新規タブ（すべて SMS_SHEET_ID 側） ----
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'tenants',
+    headers: [
+      'tenant_id', '会社名', '代表者名', '担当者名', '担当者メール', '担当者電話', '住所',
+      'plan', 'status', '申込日', 'trial_end', 'trial_free_limit',
+      'fincode_customer_id', 'fincode_card_id', 'daily_limit', 'created_at', 'updated_at'
+    ]
+  },
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'sender_numbers',
+    headers: ['tenant_id', '電話番号', '名義', 'status', '申請日', '登録日', 'sms_account_key'],
+    phoneColumns: ['電話番号']
+  },
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'templates',
+    headers: ['template_id', 'tenant_id', '名称', '本文', 'created_by', 'created_at']
+  },
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'queue',
+    headers: [
+      'queue_id', 'tenant_id', '会員ID', 'from', 'to', 'body', 'scheduled_at',
+      'status', 'result', 'sent_at', 'batch_id'
+    ],
+    phoneColumns: ['from', 'to']
+  },
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'usage',
+    headers: ['tenant_id', '年月', 'sent_count', 'free_used', 'billable_count', '更新日時']
+  },
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'invoices',
+    headers: [
+      'invoice_id', 'tenant_id', '年月', 'plan', 'sent_count', 'included',
+      'overage_count', 'base_fee', 'overage_fee', 'subtotal', 'tax', 'total',
+      'fincode_order_id', 'status', 'charged_at'
+    ]
+  },
+  {
+    sheetProp: 'SMS_SHEET_ID', tab: 'usage_system',
+    headers: ['日付', 'api_calls', 'mail_quota_remaining', 'notes']
+  }
+];
+
 function doPost(e) {
   var action = '-';
   try {
@@ -763,4 +830,160 @@ function handleListHistory_(body) {
 
   rows.sort(function(a, b) { return b.dt > a.dt ? 1 : -1; });
   return { history: rows.slice(0, 50) };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ensureSchema_: SCHEMA を走査してシート作成・不足列の追記を行う（冪等）
+//   ・シートが無ければ作成しヘッダー設定（新規タブのみ。既存必須タブは作らない）
+//   ・シートがあればヘッダー行を読み取り、不足している列だけを末尾に追加
+//   ・既存列の内容・順序は一切変更しない
+//   ・会員マスタ(api_key)への tenant_id="GSD" / role="owner" デフォルト投入も実施
+// ────────────────────────────────────────────────────────────────────
+function ensureSchema_() {
+  var report = SCHEMA.map(function(entry) {
+    return ensureSheetSchema_(entry);
+  });
+  report.push(ensureMemberDefaults_());
+  return report;
+}
+
+// SCHEMA の1エントリ分の作成/追記処理
+function ensureSheetSchema_(entry) {
+  var ss    = SpreadsheetApp.openById(getProp_(entry.sheetProp));
+  var sheet = ss.getSheetByName(entry.tab);
+  var norm  = function(h) { return String(h).normalize('NFKC').trim(); };
+  var fullHeaders = (entry.headers || []).concat(entry.appendHeaders || []);
+
+  // シートが存在しない場合
+  if (!sheet) {
+    if (!entry.headers) {
+      // 既存必須タブ（api_key 等）が見つからない場合は作成せずスキップ
+      Logger.log('[ensureSchema_] WARN: 必須タブが見つかりません: ' + entry.tab);
+      return { tab: entry.tab, action: 'skipped_missing_required' };
+    }
+    sheet = ss.insertSheet(entry.tab);
+    sheet.getRange(1, 1, 1, fullHeaders.length)
+         .setValues([fullHeaders])
+         .setFontWeight('bold').setBackground('#f0f0f0');
+    applyPhoneFormat_(sheet, fullHeaders, entry.phoneColumns, 1);
+    return { tab: entry.tab, action: 'created', headers: fullHeaders };
+  }
+
+  // シートはあるがヘッダー行すら無い（完全に空）場合
+  if (sheet.getLastRow() === 0) {
+    var headersToWrite = fullHeaders.length ? fullHeaders : (entry.appendHeaders || []);
+    if (!headersToWrite.length) return { tab: entry.tab, action: 'noop_empty_no_headers' };
+    sheet.getRange(1, 1, 1, headersToWrite.length)
+         .setValues([headersToWrite])
+         .setFontWeight('bold').setBackground('#f0f0f0');
+    applyPhoneFormat_(sheet, headersToWrite, entry.phoneColumns, 1);
+    return { tab: entry.tab, action: 'header_initialized', headers: headersToWrite };
+  }
+
+  // 既存ヘッダーを読み取り、不足列だけを末尾に追記
+  var lastCol   = sheet.getLastColumn();
+  var existing  = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(norm);
+  var existingSet = {};
+  existing.forEach(function(h) { if (h) existingSet[h] = true; });
+
+  var candidateAppend = entry.appendHeaders || entry.headers || [];
+  var toAdd = candidateAppend.filter(function(h) { return !existingSet[norm(h)]; });
+
+  if (toAdd.length === 0) {
+    return { tab: entry.tab, action: 'noop', headers: existing };
+  }
+
+  var startCol = lastCol + 1;
+  sheet.getRange(1, startCol, 1, toAdd.length)
+       .setValues([toAdd])
+       .setFontWeight('bold').setBackground('#f0f0f0');
+  applyPhoneFormat_(sheet, toAdd, entry.phoneColumns, startCol);
+
+  return { tab: entry.tab, action: 'appended', added: toAdd };
+}
+
+// 電話番号列に文字列書式 '@' を適用（先頭0欠落防止）。既存データの値は変更しない。
+function applyPhoneFormat_(sheet, headerSlice, phoneColumns, startCol) {
+  if (!phoneColumns || !phoneColumns.length) return;
+  headerSlice.forEach(function(h, i) {
+    if (phoneColumns.indexOf(h) === -1) return;
+    var col = startCol + i;
+    var rows = Math.max(sheet.getMaxRows(), 1000);
+    sheet.getRange(1, col, rows, 1).setNumberFormat('@');
+  });
+}
+
+// 会員マスタ(api_key)の既存全行に対し、tenant_id/role の空欄をデフォルト値で埋める（冪等）
+//   既に値がある行は上書きしない。列自体が無ければ何もしない
+//   （ensureSheetSchema_ が先に api_key タブへ列追加している前提）。
+function ensureMemberDefaults_() {
+  var ss    = SpreadsheetApp.openById(getProp_('MASTER_SHEET_ID'));
+  var sheet = ss.getSheetByName('api_key');
+  if (!sheet) return { tab: 'api_key', action: 'skipped_missing' };
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { tab: 'api_key', action: 'no_data_rows' };
+
+  var lastCol = sheet.getLastColumn();
+  var norm    = function(h) { return String(h).normalize('NFKC').trim(); };
+  var hdr     = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(norm);
+  var tenantCol = hdr.indexOf('tenant_id');
+  var roleCol   = hdr.indexOf('role');
+  if (tenantCol === -1 || roleCol === -1) {
+    return { tab: 'api_key', action: 'columns_missing', tenantCol: tenantCol, roleCol: roleCol };
+  }
+
+  var dataRows   = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  var tenantVals = [];
+  var roleVals   = [];
+  var tenantFilled = 0;
+  var roleFilled   = 0;
+
+  for (var r = 0; r < dataRows.length; r++) {
+    var tenantVal = String(dataRows[r][tenantCol] || '').trim();
+    var roleVal   = String(dataRows[r][roleCol]   || '').trim();
+    if (tenantVal) {
+      tenantVals.push([dataRows[r][tenantCol]]);
+    } else {
+      tenantVals.push(['GSD']);
+      tenantFilled++;
+    }
+    if (roleVal) {
+      roleVals.push([dataRows[r][roleCol]]);
+    } else {
+      roleVals.push(['owner']);
+      roleFilled++;
+    }
+  }
+
+  sheet.getRange(2, tenantCol + 1, tenantVals.length, 1).setValues(tenantVals);
+  sheet.getRange(2, roleCol + 1, roleVals.length, 1).setValues(roleVals);
+
+  return {
+    tab: 'api_key', action: 'defaults_applied',
+    dataRows: dataRows.length, tenantIdFilled: tenantFilled, roleFilled: roleFilled
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────
+// backupSpreadsheet_: MASTER_SHEET_ID / SMS_SHEET_ID をそれぞれ Drive 上にコピー
+//   ファイル名: sms_backup_master_YYYYMMDD / sms_backup_sms_YYYYMMDD
+// ────────────────────────────────────────────────────────────────────
+function backupSpreadsheet_() {
+  var dateStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd');
+
+  var masterId = getProp_('MASTER_SHEET_ID');
+  var smsId    = getProp_('SMS_SHEET_ID');
+
+  var masterCopy = DriveApp.getFileById(masterId).makeCopy('sms_backup_master_' + dateStr);
+  var smsCopy    = DriveApp.getFileById(smsId).makeCopy('sms_backup_sms_' + dateStr);
+
+  var result = {
+    date: dateStr,
+    masterBackupId: masterCopy.getId(),
+    smsBackupId: smsCopy.getId()
+  };
+  Logger.log('[backupSpreadsheet_] master backup id: ' + result.masterBackupId);
+  Logger.log('[backupSpreadsheet_] sms backup id: '    + result.smsBackupId);
+  return result;
 }
