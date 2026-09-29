@@ -1604,7 +1604,11 @@ function fincodeGetCard_(customerId, cardId) {
 // idempotentKeyは決済登録・実行の両方のfincode API呼び出しに付与する
 // （呼び出し元はinvoices.invoice_id＋試行番号を組み合わせて渡すこと）。
 // 成功時は{id, status:'CAPTURED', accessId}を返し、それ以外は例外をthrowする。
-function fincodeChargeInvoice_(orderId, customerId, cardId, amountYen, idempotentKey) {
+// fix/fincode-execute-endpoint: idempotentKeyは決済登録(create)用と決済実行(execute)用に
+// それぞれ別の値を渡すこと（同じキーをメソッド・パス・ボディが異なる2つのリクエストに
+// 使い回すと、fincode側が「初回のリクエストと現在のリクエストが異なっています。」で
+// 拒否することを実機検証で確認したため）。
+function fincodeChargeInvoice_(orderId, customerId, cardId, amountYen, createIdempotentKey, execIdempotentKey) {
   var existing = fincodeRequest_('get', '/v1/payments/' + encodeURIComponent(orderId));
   var payment = (existing.ok && existing.json && existing.json.id) ? existing.json : null;
 
@@ -1616,7 +1620,7 @@ function fincodeChargeInvoice_(orderId, customerId, cardId, amountYen, idempoten
       amount: String(Math.round(amountYen)),
       customer_id: customerId,
       card_id: cardId
-    }, idempotentKey);
+    }, createIdempotentKey);
     if (!create.ok || !create.json || !create.json.id) {
       throw new Error(fincodeErrorMessage_(create, '決済の登録に失敗しました'));
     }
@@ -1625,11 +1629,20 @@ function fincodeChargeInvoice_(orderId, customerId, cardId, amountYen, idempoten
 
   var status = String(payment.status || '').toUpperCase();
   if (status !== 'CAPTURED') {
-    var exec = fincodeRequest_('put', '/v1/payments/' + encodeURIComponent(orderId) + '/execute', {
+    // fix/fincode-execute-endpoint: fincode公式SDK(fincode-sdk-node)のソース
+    // (src/api/v1/payment.ts の execute()、"corresponds to `PUT /v1/payments/:id`"
+    // というコメント付き)で確認した正しいエンドポイントは
+    // 'PUT /v1/payments/{id}'（'/execute'サフィックスは付かない）。
+    // ボディはExecutingPaymentRequest型に合わせ、token/card_no/expire/
+    // security_codeは一切送らず、顧客ID方式(customer_id+card_id)のみを使う。
+    var exec = fincodeRequest_('put', '/v1/payments/' + encodeURIComponent(orderId), {
       pay_type: 'Card',
-      method: '1',
-      card_id: cardId
-    }, idempotentKey);
+      access_id: String(payment.access_id || ''),
+      id: orderId,
+      customer_id: customerId,
+      card_id: cardId,
+      method: '1'
+    }, execIdempotentKey);
     if (!exec.ok || !exec.json) {
       throw new Error(fincodeErrorMessage_(exec, '決済の実行に失敗しました'));
     }
@@ -1687,16 +1700,18 @@ function notifyOrderIdFormatError_(tenantId, yearMonth, orderIdLength) {
 }
 
 // fix/fincode-order-id: fincodeのidempotent_keyヘッダー用の値を、invoice_id（内部UUID）
-// ＋試行番号から決定的に導出する。
-//   検証の結果、fincodeのidempotent_keyは厳密なUUID形式でないと
-//   「冪等キーの書式が正しくありません。」で拒否されることを確認したため、
-//   単純な文字列結合（invoice_id + '-' + 試行番号）は使えない。そのため
-//   MD5ハッシュをUUID v4の見た目（8-4-4-4-12・version=4・variant=8〜b）に
-//   整形して使う。同じinvoice_id・試行番号からは常に同じ値になるため、
-//   同じ試行のリクエストが万一複数回送信されても同じキーとなり、
-//   fincode側の重複防止が正しく機能する。
-function buildIdempotentKey_(invoiceId, attemptNumber) {
-  var raw = String(invoiceId) + ':' + String(attemptNumber);
+// ＋試行番号＋phase（'create'|'execute'）から決定的に導出する。
+//   検証の結果、fincodeのidempotent_keyは(1)厳密なUUID形式でないと
+//   「冪等キーの書式が正しくありません。」で拒否され、(2)同じキーをメソッド・
+//   パス・ボディが異なる別のリクエスト（決済登録と決済実行など）に使い回すと
+//   「初回のリクエストと現在のリクエストが異なっています。」で拒否されることを
+//   確認した。そのため単純な文字列結合ではなく、invoice_id・試行番号・phaseの
+//   組をMD5ハッシュしUUID v4の見た目（8-4-4-4-12・version=4・variant=8〜b）に
+//   整形して使う。同じinvoice_id・試行番号・phaseからは常に同じ値になるため、
+//   同じリクエストが万一複数回送信されても同じキーとなり、fincode側の重複防止が
+//   正しく機能する一方、決済登録用と決済実行用は必ず別のキーになる。
+function buildIdempotentKey_(invoiceId, attemptNumber, phase) {
+  var raw = String(invoiceId) + ':' + String(attemptNumber) + ':' + String(phase || '');
   var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, raw, Utilities.Charset.UTF_8);
   var hex = digest.map(function(b) {
     return ('0' + ((b + 256) % 256).toString(16)).slice(-2);
@@ -2268,15 +2283,18 @@ function attemptInvoicePayment_(sheet, col, sheetRow, invoiceId, calcLike, tenan
 
   // idempotent_keyヘッダーの値: invoice_id(行を識別する内部UUID)＋試行番号を
   // 元にした値。同じ試行を誤って複数回送信しても二重処理されないようにするため。
-  //   検証の結果、fincodeのidempotent_keyは厳密なUUID(v4)形式でないと
-  //   「冪等キーの書式が正しくありません。」で拒否されることが判明したため、
-  //   単純な文字列結合ではなく buildIdempotentKey_ でinvoice_id＋試行番号から
-  //   決定的にUUID形式のキーを導出する（同じinvoice_id＋試行番号なら常に同じ
-  //   キーになる＝再送時も同じキーを再現できる）。
-  var idempotentKey = buildIdempotentKey_(invoiceId, attemptNumber);
+  //   検証の結果、fincodeのidempotent_keyは(1)厳密なUUID(v4)形式でないと
+  //   「冪等キーの書式が正しくありません。」で拒否され、(2)決済登録と決済実行の
+  //   ように内容(メソッド・パス・ボディ)が異なる複数のリクエストに同じキーを
+  //   使い回すと「初回のリクエストと現在のリクエストが異なっています。」で
+  //   拒否されることが判明したため、単純な文字列結合ではなく buildIdempotentKey_
+  //   でinvoice_id＋試行番号＋phase(create/execute)から決定的にUUID形式のキーを
+  //   導出し、決済登録用・決済実行用にそれぞれ別のキーを渡す。
+  var createIdempotentKey = buildIdempotentKey_(invoiceId, attemptNumber, 'create');
+  var execIdempotentKey   = buildIdempotentKey_(invoiceId, attemptNumber, 'execute');
 
   try {
-    var payment = fincodeChargeInvoice_(orderId, tenant.fincode_customer_id, tenant.fincode_card_id, calcLike.total, idempotentKey);
+    var payment = fincodeChargeInvoice_(orderId, tenant.fincode_customer_id, tenant.fincode_card_id, calcLike.total, createIdempotentKey, execIdempotentKey);
     sheet.getRange(sheetRow, col['status'] + 1).setValue('paid');
     sheet.getRange(sheetRow, col['charged_at'] + 1).setValue(new Date());
     sheet.getRange(sheetRow, col['retry_at'] + 1).setValue('');
