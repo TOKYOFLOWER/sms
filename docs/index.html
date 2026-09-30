@@ -362,6 +362,7 @@
     <div class="who">
       <span class="who-dot"></span>
       <span class="who-name" id="user-name"></span>
+      <a href="#" id="payment-status-link" class="btn-ghost hidden" style="text-decoration:none"></a>
       <button class="btn-ghost" id="signout-btn">ログアウト</button>
     </div>
   </header>
@@ -393,6 +394,10 @@
 
       <div id="form-section" class="hidden">
         <div class="card">
+
+          <div id="card-missing-banner" class="hidden" style="background:var(--danger-tint);color:var(--danger);border-radius:var(--r-chip);padding:var(--s3);font-size:13px;margin-bottom:var(--s4);line-height:1.6">
+            お支払い方法（クレジットカード）が未登録です。<a href="#" id="card-missing-banner-link" style="color:inherit;text-decoration:underline">こちらから登録</a>してください。
+          </div>
 
           <div class="sender" id="account-badge">
             <div>
@@ -824,11 +829,12 @@ async function loadTenantStatus() {
     }
 
     const planLabel = r.plan === 'standard' ? 'スタンダード' : 'ライト';
-    let text = `プラン: ${planLabel} ・ 今月の送信 ${r.sent_count || 0}件`;
+    // ついでの小修正: 送信数・無料枠の単位表記を「通」に統一する（以前は「件」だった）。
+    let text = `プラン: ${planLabel} ・ 今月の送信 ${r.sent_count || 0}通`;
     if (r.status === 'trial') {
       const freeLimit = Number(r.trial_free_limit) > 0 ? Number(r.trial_free_limit) : TENANT_STATUS_FREE_LIMIT;
       const remain = Math.max(0, freeLimit - (Number(r.free_used) || 0));
-      text += ` ・ 残り無料枠 ${remain}件`;
+      text += ` ・ 残り無料枠 ${remain}通`;
     }
     let html = escHtml(text);
     // 積み残し2件目: 送信元番号がregistered済みでない場合の案内文言（追記のみ、既存表示は変えない）
@@ -837,8 +843,35 @@ async function loadTenantStatus() {
     }
     el.innerHTML = html;
     el.classList.remove('hidden');
+
+    // feat/fincode: お支払い方法（カード）の状況をヘッダー・バナーへ反映する
+    updatePaymentStatusUi(r);
   } catch (_) {
     // 取得失敗時は静かに非表示のまま（既存の送信フローを妨げない）
+  }
+}
+
+// feat/fincode: ヘッダーの「お支払い方法」リンクと、未登録時の案内バナーを更新する。
+//   card.htmlへはセッショントークンをURLフラグメント(#token=...)経由で渡す
+//   （クエリ文字列やサーバログに残らないようにするため）。
+function updatePaymentStatusUi(r) {
+  const link = document.getElementById('payment-status-link');
+  const banner = document.getElementById('card-missing-banner');
+  const bannerLink = document.getElementById('card-missing-banner-link');
+  if (!link) return;
+
+  const cardUrl = './card.html#token=' + encodeURIComponent(token || '');
+  link.href = cardUrl;
+  if (bannerLink) bannerLink.href = cardUrl;
+
+  if (r.hasCard) {
+    link.textContent = '**** ' + (r.cardLast4 || '----');
+    link.classList.remove('hidden');
+    if (banner) banner.classList.add('hidden');
+  } else {
+    link.textContent = 'お支払い方法: 未登録（登録する）';
+    link.classList.remove('hidden');
+    if (banner) banner.classList.remove('hidden');
   }
 }
 
@@ -849,6 +882,11 @@ function signOut() {
   document.getElementById('login-id').value = '';
   document.getElementById('login-pw').value = '';
   document.getElementById('history-section').classList.add('hidden');
+  // feat/fincode: 失効したトークンを含むリンクを残さない
+  const paymentLink = document.getElementById('payment-status-link');
+  if (paymentLink) { paymentLink.classList.add('hidden'); paymentLink.removeAttribute('href'); }
+  const banner = document.getElementById('card-missing-banner');
+  if (banner) banner.classList.add('hidden');
   showStep('login');
 }
 
@@ -947,6 +985,9 @@ async function handleConfirm() {
       document.getElementById('message').value = '';
       updateCharCount();
       showToast('送信しました (' + data.result.segments + ' SMS)', 'success');
+      // ついでの小修正: 送信直後は今月の送信数・残り無料枠が古い値のまま表示され
+      // 続けていたため、myTenantStatusを再取得して表示を更新する。
+      loadTenantStatus();
     } else {
       if (/有効期限|再ログイン/.test(data.error || '')) {
         showToast(data.error, 'error');
