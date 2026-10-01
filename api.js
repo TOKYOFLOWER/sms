@@ -276,6 +276,12 @@ function handleSendSms_(body) {
   rateLimitCheck_(id);
 
   var tenant = resolveTenantForMember_(member);
+  // fix/usage-recording: 以前はこの単発送信経路だけcheckSendAllowed_を一切
+  // 呼んでおらず、日次上限チェックも無料枠判定(isFree)も行われないまま送信が
+  // 通っていた（usageへの計上漏れの一因）。processQueue_/bulkSendと同じ経路に
+  // 統一する。
+  var allow = checkSendAllowed_(tenant, 1);
+
   var resolved = resolveEffectiveSmsAccountIdSafe_(member, tenant);
   if (!resolved || !resolved.smsAccountId) {
     throw new Error('送信元番号の準備中です。しばらくお待ちください');
@@ -293,6 +299,7 @@ function handleSendSms_(body) {
   });
   if (!result.success) throw new Error(result.message);
   if (isFallback) incrementFallbackSendCount_(tenant.tenant_id);
+  recordUsage_(tenant.tenant_id, allow.isFree, resolveSentSegments_(result, body.text));
   return { segments: result.how_many_message_parts, message: result.result_message };
 }
 
@@ -306,6 +313,10 @@ function handleSendSmsForm_(body) {
   rateLimitCheck_(id);
 
   var tenant = resolveTenantForMember_(member);
+  // fix/usage-recording: handleSendSms_と同様、checkSendAllowed_を通して
+  // 日次上限チェック・無料枠判定(isFree)を行う（以前は未実施だった）。
+  var allow = checkSendAllowed_(tenant, 1);
+
   var resolved = resolveEffectiveSmsAccountIdSafe_(member, tenant);
   if (!resolved || !resolved.smsAccountId) {
     throw new Error('送信元番号の準備中です。しばらくお待ちください');
@@ -323,6 +334,7 @@ function handleSendSmsForm_(body) {
   });
   if (!result.success) throw new Error(result.message);
   if (isFallback) incrementFallbackSendCount_(tenant.tenant_id);
+  recordUsage_(tenant.tenant_id, allow.isFree, resolveSentSegments_(result, body.text));
   return result;
 }
 
@@ -471,12 +483,20 @@ function getTenantById_(tenantId) {
   return null;
 }
 
-// usage タブへの計上（tenant_id・当月の行が無ければ新規作成）。
-//   isFree=true なら free_used のみ+1。isFree=false なら billable_count と
-//   sent_count の両方を +segments（addendum C: 分割数分を課金単位として計上）。
+// fix/usage-recording: usage タブへの計上（tenant_id・当月の行が無ければ新規作成）。
+//   全ての送信経路（handleSendSms_/handleSendSmsForm_/processQueue_、フォールバック
+//   送信も含む）は、送信成功後に必ずこの関数を1つだけ通すこと（以前は
+//   processQueue_経由(queue/一斉送信)の送信だけがusageへ計上され、
+//   handleSendSms_/handleSendSmsForm_経由の単発送信はusageに一切計上されない
+//   バグがあった。incrementUsage_という名前だったものをrecordUsage_に統一改名）。
+//   sent_count: 無料/課金を問わず実際に送信した総セグメント数（常に+segments）。
+//   free_used:  trial無料枠を消費した送信の「回数」（+1。セグメント数ではない。
+//     checkSendAllowed_/transitionTrialIfNeeded_が「回数」で無料枠を判定している
+//     既存設計に合わせている）。
+//   billable_count: 無料枠を超えた課金対象送信の合計セグメント数（+segments）。
 //   ※ processQueue_ がスクリプトロック保持中に呼ぶ前提のため、ここでは
 //     二重ロックによるデッドロックを避けるため独自のロックは取得しない。
-function incrementUsage_(tenantId, isFree, segments) {
+function recordUsage_(tenantId, isFree, segments) {
   segments = Number(segments) > 0 ? Number(segments) : 1;
   var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
   var sheet = ss.getSheetByName('usage');
@@ -497,14 +517,14 @@ function incrementUsage_(tenantId, isFree, segments) {
     if (String(data[r][col['年月']]).trim() !== ym) continue;
 
     var sheetRow = r + 2;
+    var newSent = (Number(data[r][col['sent_count']]) || 0) + segments;
+    sheet.getRange(sheetRow, col['sent_count'] + 1).setValue(newSent);
     if (isFree) {
       var newFree = (Number(data[r][col['free_used']]) || 0) + 1;
       sheet.getRange(sheetRow, col['free_used'] + 1).setValue(newFree);
     } else {
       var newBillable = (Number(data[r][col['billable_count']]) || 0) + segments;
-      var newSent     = (Number(data[r][col['sent_count']])     || 0) + segments;
       sheet.getRange(sheetRow, col['billable_count'] + 1).setValue(newBillable);
-      sheet.getRange(sheetRow, col['sent_count'] + 1).setValue(newSent);
     }
     if (col['更新日時'] !== undefined) sheet.getRange(sheetRow, col['更新日時'] + 1).setValue(new Date());
     return;
@@ -514,13 +534,24 @@ function incrementUsage_(tenantId, isFree, segments) {
   var newRow = hdr.map(function(h) {
     if (h === 'tenant_id')       return tenantId;
     if (h === '年月')            return ym;
-    if (h === 'sent_count')      return isFree ? 0 : segments;
+    if (h === 'sent_count')      return segments;
     if (h === 'free_used')       return isFree ? 1 : 0;
     if (h === 'billable_count')  return isFree ? 0 : segments;
     if (h === '更新日時')        return new Date();
     return '';
   });
   sheet.appendRow(newRow);
+}
+
+// fix/usage-recording: recordUsage_に渡すセグメント数を、送信結果(sendSingleSMSFromForm
+// の戻り値)が持つ実際のキャリア確定値(how_many_message_parts)から優先的に求める
+// （フォールバック送信のプレフィックス付与等でローカル再計算と食い違う可能性がある
+// ため、キャリアが実際に課金した値を優先する）。取得できない場合のみ、本文から
+// calcSegments_で計算した値にフォールバックする。
+function resolveSentSegments_(sendResult, rawBody) {
+  var fromResult = Number(sendResult && sendResult.how_many_message_parts);
+  if (fromResult > 0) return fromResult;
+  try { return calcSegments_(rawBody) || 1; } catch (e) { return 1; }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2018,9 +2049,7 @@ function processQueue_() {
         stats.sent++;
         if (isFallback) incrementFallbackSendCount_(tenantId);
 
-        var segments = 1;
-        try { segments = calcSegments_(msgBody) || 1; } catch (_) { segments = 1; }
-        incrementUsage_(tenantId, isFree, segments);
+        recordUsage_(tenantId, isFree, resolveSentSegments_(sendResult, msgBody));
 
       } else {
         retryCount++;
@@ -2096,20 +2125,22 @@ function recordUsageSystem_(dateKey, apiCallsDelta, mailQuotaRemaining) {
 
 // ────────────────────────────────────────────────────────────────────
 // feat/fincode: 月次請求金額の計算単一情報源。
-//   light   : 基本料金0円。billable_count(=無料枠30通を除いた課金対象通数)を
+//   light   : 基本料金0円。billable_count(=無料枠を除いた課金対象通数)を
 //             単価15円で課金。
-//   standard: 基本料金5,500円（込み500通）＋超過分を単価12円で課金。
-//   ※ usage.sent_count と usage.billable_count は常に同値（incrementUsage_が
-//     無料送信時はfree_usedのみ+1し、課金対象送信時のみ両方に+segmentsする
-//     ため、sent_count自体が既に「無料枠を除いた課金対象通数」になっている）。
-//     よってtrial中の無料枠30通は、ここでの計算に持ち込む前に既にusage側で
-//     除外済みである。
+//   standard: 基本料金5,500円（込み500通）＋billable_countの超過分を単価12円で課金。
+//   fix/usage-recording: 以前はusage.sent_countを課金計算の母数にしており、
+//     「sent_countは無料送信時には増えない（=実質billable_countと同値）」という
+//     前提に依存していたが、単発送信経路でusage計上自体が漏れていたバグ調査の
+//     過程でこの前提を見直した。sent_countは「実際に送信した総セグメント数
+//     （無料・課金を問わない）」という直感的な意味に統一し、課金計算には
+//     billable_count（trial無料枠を除いた、実際に課金対象となった送信の
+//     セグメント数）を使う設計に変更した。
 //   消費税率10%、円未満の端数は切り捨て(Math.floor)とする
 //     （切り捨て/四捨五入/切り上げのいずれも許容されるが、請求額が実際の
 //     税額より大きくならない「切り捨て」を採用した。判断に迷った点として
 //     実装報告に記載）。
-//   sent_count(=billable_count)が0の場合は基本料金も含めて請求しない
-//     （total=0・status='skipped'。送信が1件も無い月にstandardの基本料金
+//   billable_countが0の場合は基本料金も含めて請求しない（total=0・status='skipped'。
+//     送信が1件も無い月、またはtrial無料枠内に収まった月にstandardの基本料金
 //     5,500円だけ請求するのは不自然なため、というのがこの判断の理由）。
 // ────────────────────────────────────────────────────────────────────
 var INVOICE_BILLING = {
@@ -2121,16 +2152,17 @@ var INVOICE_TAX_RATE = 0.10;
 function calcInvoiceAmount_(plan, usage) {
   var p = (String(plan || '').trim().toLowerCase() === 'standard') ? 'standard' : 'light';
   var billing = INVOICE_BILLING[p];
-  var sentCount = Number(usage && usage.sent_count) || 0;
+  var sentCount     = Number(usage && usage.sent_count) || 0;
+  var billableCount = Number(usage && usage.billable_count) || 0;
 
-  if (sentCount === 0) {
+  if (billableCount === 0) {
     return {
-      plan: p, sent_count: 0, included: billing.includedCount, overage_count: 0,
+      plan: p, sent_count: sentCount, included: billing.includedCount, overage_count: 0,
       base_fee: 0, overage_fee: 0, subtotal: 0, tax: 0, total: 0, status: 'skipped'
     };
   }
 
-  var overageCount = Math.max(0, sentCount - billing.includedCount);
+  var overageCount = Math.max(0, billableCount - billing.includedCount);
   var baseFee    = billing.baseFee;
   var overageFee = overageCount * billing.overageRate;
   var subtotal   = baseFee + overageFee;
@@ -2251,6 +2283,157 @@ function appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, status) {
   return { sheet: sheet, col: col, sheetRow: sheet.getLastRow(), hdr: hdr };
 }
 
+// fix/usage-recording + fix/invoice-id-format: 既存のinvoices行をtenant_id・年月で
+// 特定し、行自体は同一のまま、invoice_id・請求内訳・statusを新しい計算結果で
+// 上書きする（closeMonthRunを同じ年月で再実行した際に重複行を作らないため）。
+//   呼び出し元は、status='paid'（決済済み）または'failed'/'processing'（既存の
+//   retry/dailyResetCheck_の状態機械が管理中）の行には絶対にこれを呼ばないこと
+//   （決済済み行のinvoice_idを書き換えると追跡できなくなるため）。'skipped'/
+//   'unpaid'の行の再計算専用。
+function updateInvoiceRowInPlace_(tenantId, yearMonth, calc, status, newInvoiceId) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('invoices');
+  if (!sheet) throw new Error('invoices タブが存在しません');
+  var lastCol = sheet.getLastColumn();
+  var hdr = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  var data = sheet.getDataRange().getValues();
+
+  for (var r = 1; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (String(data[r][col['年月']]).trim() !== String(yearMonth).trim()) continue;
+    var sheetRow = r + 1;
+    var setIf = function(name, value) {
+      if (col[name] !== undefined) sheet.getRange(sheetRow, col[name] + 1).setValue(value);
+    };
+    setIf('invoice_id', newInvoiceId);
+    setIf('plan', calc.plan);
+    setIf('sent_count', calc.sent_count);
+    setIf('included', calc.included);
+    setIf('overage_count', calc.overage_count);
+    setIf('base_fee', calc.base_fee);
+    setIf('overage_fee', calc.overage_fee);
+    setIf('subtotal', calc.subtotal);
+    setIf('tax', calc.tax);
+    setIf('total', calc.total);
+    setIf('status', status);
+    // 再計算のたびに前回試行の痕跡（fincode_order_id・課金日時・リトライ状態）を
+    // クリアする（この関数はskipped/unpaidの行専用のため、過去に実際の決済
+    // 試行は行われていないはずだが、念のため安全側で初期化する）。
+    setIf('fincode_order_id', '');
+    setIf('charged_at', '');
+    setIf('retry_at', '');
+    setIf('retry_count', 0);
+    setIf('fincode_access_id', '');
+    return { sheet: sheet, col: col, sheetRow: sheetRow, hdr: hdr };
+  }
+  throw new Error('該当する既存invoice行が見つかりません: ' + tenantId + '/' + yearMonth);
+}
+
+// fix/usage-recording: logタブを正として、指定tenant_id・年月のusageを再集計する。
+//   sent_count: 対象月の「送信成功」ログの how_many_messages 合計
+//     （無料・課金を問わない、実際に送信した総セグメント数）。
+//   free_used:  trial無料枠(tenants.trial_free_limit。無ければPLAN_LIMITS.freeLimit)を
+//     消費した送信の「回数」。対象月がテナントのtrial期間（申込日〜trial_end）と
+//     重なっている場合のみ、ログを送信日時の昇順に処理し、残り無料枠がある間は
+//     無料として分類する（recordUsage_のisFree判定ロジックと同じ考え方を、
+//     ログから事後的に再現している）。
+//   billable_count: 上記で無料に分類されなかった送信のセグメント数合計
+//     （calcInvoiceAmount_の課金計算はこちらを使う）。
+function recalcUsageFromLog_(tenantId, yearMonth) {
+  var tenant = getTenantById_(tenantId);
+  var limits = getPlanLimits_(tenant || { plan: 'light' });
+  var freeLimit = (tenant && Number(tenant.trial_free_limit) > 0) ? Number(tenant.trial_free_limit) : limits.freeLimit;
+
+  var year  = Number(String(yearMonth).substring(0, 4));
+  var month = Number(String(yearMonth).substring(4, 6));
+  var monthStart = new Date(year, month - 1, 1, 0, 0, 0);
+  var monthEnd   = new Date(year, month, 0, 23, 59, 59);
+  var trialEnd   = (tenant && tenant.trial_end) ? new Date(tenant.trial_end) : null;
+  var signedUpAt = (tenant && tenant['申込日']) ? new Date(tenant['申込日']) : null;
+  var isTrialMonth = !!(trialEnd && !isNaN(trialEnd.getTime()) && monthStart <= trialEnd &&
+                         (!signedUpAt || isNaN(signedUpAt.getTime()) || monthEnd >= signedUpAt));
+
+  var ss = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var logSheet = ss.getSheetByName('log');
+  var rows = [];
+  if (logSheet && logSheet.getLastRow() >= 2) {
+    var hdr = logSheet.getRange(1, 1, 1, logSheet.getLastColumn()).getValues()[0]
+                .map(function(h) { return String(h).normalize('NFKC').trim(); });
+    var col = {};
+    hdr.forEach(function(h, i) { col[h] = i; });
+    if (col['tenant_id'] !== undefined && col['送信日時'] !== undefined && col['ステータス'] !== undefined) {
+      var data = logSheet.getDataRange().getValues();
+      for (var r = 1; r < data.length; r++) {
+        if (String(data[r][col['tenant_id']] || '').trim() !== String(tenantId).trim()) continue;
+        if (String(data[r][col['ステータス']] || '').trim() !== '送信成功') continue;
+        var sentAt = new Date(data[r][col['送信日時']]);
+        if (isNaN(sentAt.getTime())) continue;
+        if (Utilities.formatDate(sentAt, 'Asia/Tokyo', 'yyyyMM') !== String(yearMonth)) continue;
+        var segs = col['how_many_messages'] !== undefined ? Number(data[r][col['how_many_messages']]) : 0;
+        if (!(segs > 0)) segs = 1;
+        rows.push({ sentAt: sentAt, segments: segs });
+      }
+    }
+  }
+  rows.sort(function(a, b) { return a.sentAt - b.sentAt; });
+
+  var freeMsgCount = 0, freeSegments = 0, billableSegments = 0;
+  rows.forEach(function(row) {
+    if (isTrialMonth && freeMsgCount < freeLimit) {
+      freeMsgCount++;
+      freeSegments += row.segments;
+    } else {
+      billableSegments += row.segments;
+    }
+  });
+
+  return {
+    sent_count: freeSegments + billableSegments,
+    free_used: freeMsgCount,
+    billable_count: billableSegments
+  };
+}
+
+// fix/usage-recording: recalcUsageFromLog_の結果でusageタブの該当行を上書きする
+// （無ければ新規作成）。usageタブは「logから再集計した値のキャッシュ」という
+// 位置づけにするため、closeMonth_実行時には必ずこれで最新化する。
+function upsertUsageRow_(tenantId, yearMonth, computed) {
+  var ss    = SpreadsheetApp.openById(getProp_('SMS_SHEET_ID'));
+  var sheet = ss.getSheetByName('usage');
+  if (!sheet) return;
+  var lastCol = sheet.getLastColumn();
+  var hdr = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).normalize('NFKC').trim(); });
+  var col = {};
+  hdr.forEach(function(h, i) { col[h] = i; });
+  if (col['tenant_id'] === undefined || col['年月'] === undefined) return;
+
+  var lastRow = sheet.getLastRow();
+  var data = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, lastCol).getValues() : [];
+  for (var r = 0; r < data.length; r++) {
+    if (String(data[r][col['tenant_id']]).trim() !== String(tenantId).trim()) continue;
+    if (String(data[r][col['年月']]).trim() !== String(yearMonth).trim()) continue;
+    var sheetRow = r + 2;
+    if (col['sent_count'] !== undefined) sheet.getRange(sheetRow, col['sent_count'] + 1).setValue(computed.sent_count);
+    if (col['free_used'] !== undefined) sheet.getRange(sheetRow, col['free_used'] + 1).setValue(computed.free_used);
+    if (col['billable_count'] !== undefined) sheet.getRange(sheetRow, col['billable_count'] + 1).setValue(computed.billable_count);
+    if (col['更新日時'] !== undefined) sheet.getRange(sheetRow, col['更新日時'] + 1).setValue(new Date());
+    return;
+  }
+
+  var newRow = hdr.map(function(h) {
+    if (h === 'tenant_id')      return tenantId;
+    if (h === '年月')           return yearMonth;
+    if (h === 'sent_count')     return computed.sent_count;
+    if (h === 'free_used')      return computed.free_used;
+    if (h === 'billable_count') return computed.billable_count;
+    if (h === '更新日時')       return new Date();
+    return '';
+  });
+  sheet.appendRow(newRow);
+}
+
 // 1件のinvoice行に対して実際の決済を試みる共通処理（closeMonth_の初回実行・
 // dailyResetCheck_の再試行・管理画面の手動「再実行」の3経路から共通で呼ばれる）。
 //   成功 → status='paid'・charged_at設定・retry_atクリア・請求明細メール送信。
@@ -2329,6 +2512,84 @@ function attemptInvoicePayment_(sheet, col, sheetRow, invoiceId, calcLike, tenan
 //   同一tenant_id・年月のinvoiceが既に存在する場合は重複作成しない
 //   （closeMonth_の再実行・closeMonthRunの手動再実行に対する冪等性。
 //   failed分の再試行はdailyResetCheck_/管理画面の「再実行」ボタンの役割とする）。
+// fix/usage-recording: 1テナント分の請求確定処理（runCloseMonthForYearMonth_の
+// ループ本体を切り出したもの）。全テナント一括処理のcloseMonth_/closeMonthRunと、
+// 単一テナントだけを対象にしたテスト・調査経路の両方から、同じロジックを
+// 必ず共有して呼べるようにするための分離（ロジックの二重実装を避けるため）。
+function processTenantInvoiceForMonth_(tenant, yearMonth, dryRun, stats) {
+  var tenantId = String(tenant.tenant_id || '').trim();
+  if (!tenantId || tenantId === 'GSD') return; // GSDは商用課金対象外（既存運用への影響回避）
+
+  stats.processed++;
+  // fix/usage-recording: usageタブを直接参照せず、logタブを正として都度
+  // 再集計する（usageタブへの計上漏れがあっても請求額には影響しない設計にする）。
+  // dryRunでない場合は、再集計した値でusageタブ（キャッシュ）も上書きする。
+  var usage = recalcUsageFromLog_(tenantId, yearMonth);
+  if (!dryRun) upsertUsageRow_(tenantId, yearMonth, usage);
+  var calc     = calcInvoiceAmount_(tenant.plan, usage);
+  var calcLike = calcToCalcLike_(calc, yearMonth);
+
+  if (dryRun) {
+    var expected = calc.status === 'skipped' ? 'skipped' : (tenant.fincode_card_id ? '決済実行対象' : 'unpaid');
+    stats.invoices.push({
+      tenant_id: tenantId, plan: calc.plan, sent_count: calc.sent_count,
+      total: calc.total, expected_status: expected
+    });
+    if (calc.status === 'skipped') stats.skipped++;
+    return;
+  }
+
+  var existing = findInvoiceByTenantAndMonth_(tenantId, yearMonth);
+  // fix/invoice-id-format: paid・failed・processingの既存行は、この再集計パスでは
+  // 一切変更しない（決済済み行のinvoice_idを書き換えると追跡できなくなる、
+  // failed/processingは既存のretry/dailyResetCheck_の状態機械に委ねるため）。
+  // skipped/unpaidの既存行のみ、再計算結果で「同じ行を」上書き更新する
+  // （closeMonthRunを同じ年月で再実行しても重複行を作らないため）。
+  if (existing && existing.status !== 'skipped' && existing.status !== 'unpaid') {
+    stats.invoices.push({ tenant_id: tenantId, invoice_id: existing.invoice_id, status: existing.status, note: 'already_exists_untouched' });
+    return;
+  }
+
+  // fix/invoice-id-format: invoice_idもbuildFincodeOrderId_と同じ書式
+  // （英数字30桁以内）に統一する。試行番号は常に1固定
+  // （invoice_idは行の恒久的な識別子であり、決済リトライのたびに変わる
+  // fincode_order_idとは別物。tenant_id+年月の組で一意になるため、試行番号を
+  // 固定しても衝突しない）。
+  var newInvoiceId;
+  try {
+    newInvoiceId = buildFincodeOrderId_(tenantId, yearMonth, 1);
+  } catch (e) {
+    Logger.log('[processTenantInvoiceForMonth_] invoice_id生成エラー tenant=' + tenantId + ' ' + e.message);
+    stats.invoices.push({ tenant_id: tenantId, status: 'error', note: 'invoice_id_format_error' });
+    return;
+  }
+
+  if (calc.status === 'skipped') {
+    if (existing) updateInvoiceRowInPlace_(tenantId, yearMonth, calc, 'skipped', newInvoiceId);
+    else appendInvoiceRow_(newInvoiceId, tenantId, yearMonth, calc, 'skipped');
+    stats.skipped++;
+    stats.invoices.push({ tenant_id: tenantId, invoice_id: newInvoiceId, status: 'skipped' });
+    return;
+  }
+
+  if (!tenant.fincode_card_id) {
+    if (existing) updateInvoiceRowInPlace_(tenantId, yearMonth, calc, 'unpaid', newInvoiceId);
+    else appendInvoiceRow_(newInvoiceId, tenantId, yearMonth, calc, 'unpaid');
+    sendCardRegistrationRequestEmail_(tenant);
+    stats.unpaid++;
+    stats.invoices.push({ tenant_id: tenantId, invoice_id: newInvoiceId, status: 'unpaid' });
+    return;
+  }
+
+  var appended = existing
+    ? updateInvoiceRowInPlace_(tenantId, yearMonth, calc, 'processing', newInvoiceId)
+    : appendInvoiceRow_(newInvoiceId, tenantId, yearMonth, calc, 'processing');
+  var outcome  = attemptInvoicePayment_(appended.sheet, appended.col, appended.sheetRow, newInvoiceId, calcLike, tenant, 0);
+  if (outcome.status === 'paid') stats.paid++;
+  else { stats.failed++; if (outcome.suspended) stats.suspended++; }
+  stats.invoices.push({ tenant_id: tenantId, invoice_id: newInvoiceId, status: outcome.status });
+}
+
 function runCloseMonthForYearMonth_(yearMonth, opts) {
   opts = opts || {};
   var dryRun = !!opts.dryRun;
@@ -2339,52 +2600,7 @@ function runCloseMonthForYearMonth_(yearMonth, opts) {
   };
 
   tenants.forEach(function(tenant) {
-    var tenantId = String(tenant.tenant_id || '').trim();
-    if (!tenantId || tenantId === 'GSD') return; // GSDは商用課金対象外（既存運用への影響回避）
-
-    stats.processed++;
-    var usage    = getUsageRow_(tenantId, yearMonth) || { sent_count: 0, free_used: 0, billable_count: 0 };
-    var calc     = calcInvoiceAmount_(tenant.plan, usage);
-    var calcLike = calcToCalcLike_(calc, yearMonth);
-
-    if (dryRun) {
-      var expected = calc.status === 'skipped' ? 'skipped' : (tenant.fincode_card_id ? '決済実行対象' : 'unpaid');
-      stats.invoices.push({
-        tenant_id: tenantId, plan: calc.plan, sent_count: calc.sent_count,
-        total: calc.total, expected_status: expected
-      });
-      if (calc.status === 'skipped') stats.skipped++;
-      return;
-    }
-
-    var existing = findInvoiceByTenantAndMonth_(tenantId, yearMonth);
-    if (existing) {
-      stats.invoices.push({ tenant_id: tenantId, invoice_id: existing.invoice_id, status: existing.status, note: 'already_exists' });
-      return;
-    }
-
-    if (calc.status === 'skipped') {
-      var invoiceIdSkip = Utilities.getUuid();
-      appendInvoiceRow_(invoiceIdSkip, tenantId, yearMonth, calc, 'skipped');
-      stats.skipped++;
-      stats.invoices.push({ tenant_id: tenantId, invoice_id: invoiceIdSkip, status: 'skipped' });
-      return;
-    }
-
-    var invoiceId = Utilities.getUuid();
-    if (!tenant.fincode_card_id) {
-      appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, 'unpaid');
-      sendCardRegistrationRequestEmail_(tenant);
-      stats.unpaid++;
-      stats.invoices.push({ tenant_id: tenantId, invoice_id: invoiceId, status: 'unpaid' });
-      return;
-    }
-
-    var appended = appendInvoiceRow_(invoiceId, tenantId, yearMonth, calc, 'processing');
-    var outcome  = attemptInvoicePayment_(appended.sheet, appended.col, appended.sheetRow, invoiceId, calcLike, tenant, 0);
-    if (outcome.status === 'paid') stats.paid++;
-    else { stats.failed++; if (outcome.suspended) stats.suspended++; }
-    stats.invoices.push({ tenant_id: tenantId, invoice_id: invoiceId, status: outcome.status });
+    processTenantInvoiceForMonth_(tenant, yearMonth, dryRun, stats);
   });
 
   return stats;
@@ -2834,11 +3050,16 @@ function handleRetryInvoice_(body) {
 //                                    170通超過）→ 5,500円 + 170×12円=2,040円
 //                                    = 7,540円 + 税754円 = 8,294円
 function testInvoiceCalc_() {
+  // fix/usage-recording: calcInvoiceAmount_の課金計算の母数がsent_countから
+  // billable_countに変わったため、テストケースのusageにもbillable_countを
+  // 設定する（ここではtrial無料枠控除後の通数＝課金対象通数をそのまま
+  // sent_count・billable_count両方に入れている。無料枠との混在パターンの
+  // 検証はtestPlanGuards_/実データでのA-5再計算で別途行う）。
   var cases = [
-    { label: 'light_0通',      plan: 'light',    usage: { sent_count: 0 },   expectedTotal: 0,    expectedStatus: 'skipped' },
-    { label: 'light_200通(無料枠30通控除後170通)', plan: 'light',    usage: { sent_count: 170 }, expectedTotal: 2805, expectedStatus: null },
-    { label: 'standard_400通(無料枠30通控除後370通)', plan: 'standard', usage: { sent_count: 370 }, expectedTotal: 6050, expectedStatus: null },
-    { label: 'standard_700通(無料枠30通控除後670通)', plan: 'standard', usage: { sent_count: 670 }, expectedTotal: 8294, expectedStatus: null }
+    { label: 'light_0通',      plan: 'light',    usage: { sent_count: 0,   billable_count: 0 },   expectedTotal: 0,    expectedStatus: 'skipped' },
+    { label: 'light_200通(無料枠30通控除後170通)', plan: 'light',    usage: { sent_count: 170, billable_count: 170 }, expectedTotal: 2805, expectedStatus: null },
+    { label: 'standard_400通(無料枠30通控除後370通)', plan: 'standard', usage: { sent_count: 370, billable_count: 370 }, expectedTotal: 6050, expectedStatus: null },
+    { label: 'standard_700通(無料枠30通控除後670通)', plan: 'standard', usage: { sent_count: 670, billable_count: 670 }, expectedTotal: 8294, expectedStatus: null }
   ];
 
   var results = cases.map(function(c) {
